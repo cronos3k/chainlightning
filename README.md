@@ -43,7 +43,7 @@ Tested with 5 WAN links (3x ADSL + 2x Starlink):
                      │    └────┬────┘      │            │    └────┬────┘        │
                      │   ┌─┬──┴──┬─┬─┐     │            │    ┌─┬──┴──┬─┬─┐      │
                      │   │ │  │  │ │ │     │            │    │ │  │  │ │ │      │
-                     └───┤L0│L1│L2│L3│L4├───┘           └───┤ UDP Listeners ├───┘
+                     └───┤L0│L1│L2│L3│L4├──┘            └───┤ UDP Listeners ├───┘
                          └┬─┴┬─┴┬─┴┬─┴┬┘                    └───────────────┘
                           │  │  │  │  │
                      ADSL1 Star1 ADSL2 Star2 ADSL3
