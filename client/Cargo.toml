@@ -1,0 +1,17 @@
+[package]
+name = "chainlightning_client"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "client"
+path = "src/main.rs"
+
+[dependencies]
+chainlightning_common = { workspace = true }
+chainlightning_core = { workspace = true }
+chainlightning_testing = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+libc = { workspace = true }

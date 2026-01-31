@@ -1,0 +1,44 @@
+[workspace]
+members = [
+    "common",
+    "core",
+    "testing",
+    "server",
+    "client",
+]
+resolver = "2"
+
+[workspace.package]
+version = "4.0.0"
+edition = "2021"
+authors = ["ChainLightning Team"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Networking
+libc = "0.2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Statistics
+statrs = "0.16"
+
+# Configuration
+notify = "6.1"  # File watching for hot-reload
+
+# Internal crates
+chainlightning_common = { path = "common" }
+chainlightning_core = { path = "core" }
+chainlightning_testing = { path = "testing" }

@@ -1,0 +1,169 @@
+# ChainLightning v4 Configuration
+# All parameters are A/B testable - no recompilation needed!
+# Reload by sending SIGHUP or restarting the service.
+#
+# Copy this file to config.yaml and adjust for your network.
+
+flow_classifier:
+  # Below this ratio of fastest link, use single-link mode
+  single_link_threshold: 0.66
+  # Above this ratio, use multi-link mode
+  multi_link_threshold: 0.90
+  # How long flow must sustain before switching to multi-link (ms)
+  monitor_duration_ms: 2000
+  # Sliding window for bandwidth estimation (ms)
+  flow_window_ms: 1000
+  # Flow expiry timeout - remove inactive flows (ms)
+  flow_expiry_ms: 30000
+
+chunk_aggregator:
+  # Minimum chunk size (bytes) - MTU sized
+  min_chunk_size: 1400
+  # Maximum chunk size (bytes) - 64KB max
+  max_chunk_size: 65536
+  # Multiplier on BDP calculation
+  bdp_multiplier: 1.0
+  # Maximum wait before sending partial chunk (ms)
+  aggregation_timeout_ms: 5
+
+link_scheduler:
+  # Target arrival synchronization window (ms)
+  sync_interval_ms: 50
+  # Maximum delay for synchronization (ms)
+  max_send_delay_ms: 100
+  # Enable/disable arrival synchronization
+  enable_sync: true
+  # Scheduling strategy: "tiered_fill", "round_robin", "single_best", "weighted"
+  strategy: "tiered_fill"
+  # Enable flow affinity (same flow stays on same link)
+  flow_affinity: true
+  # Reassign flow after this many seconds of inactivity
+  flow_affinity_timeout_secs: 30
+
+  # Link tier configuration (priority order, capacities)
+  # Priority: lower = higher priority, filled first
+  # Links are filled to utilization_threshold before moving to next tier
+  #
+  # Adjust link_id, capacities, and link_type for your WAN links.
+  # link_id corresponds to the order of WAN interfaces configured in the client/server.
+  link_tiers:
+    # Example: ADSL link (low latency, moderate bandwidth)
+    - link_id: 0
+      priority: 1
+      capacity_down_bps: 7812500   # 62.5 Mbps
+      capacity_up_bps: 1587500     # 12.7 Mbps
+      utilization_threshold: 0.90
+      realtime_eligible: true
+      link_type: "adsl"
+
+    # Example: Second ADSL link
+    - link_id: 2
+      priority: 2
+      capacity_down_bps: 7812500   # 62.5 Mbps
+      capacity_up_bps: 1587500     # 12.7 Mbps
+      utilization_threshold: 0.90
+      realtime_eligible: true
+      link_type: "adsl"
+
+    # Example: Starlink link (high bandwidth, variable latency)
+    - link_id: 1
+      priority: 3
+      capacity_down_bps: 27500000  # 220 Mbps
+      capacity_up_bps: 2500000     # 20 Mbps
+      utilization_threshold: 0.95
+      realtime_eligible: false     # High latency - not for realtime
+      link_type: "starlink"
+
+    # Example: Second Starlink link
+    - link_id: 3
+      priority: 4
+      capacity_down_bps: 27500000  # 220 Mbps
+      capacity_up_bps: 2500000     # 20 Mbps
+      utilization_threshold: 0.95
+      realtime_eligible: false
+      link_type: "starlink"
+
+    # Example: Third ADSL/DSL link
+    - link_id: 4
+      priority: 5
+      capacity_down_bps: 7812500
+      capacity_up_bps: 1587500
+      utilization_threshold: 0.90
+      realtime_eligible: true
+      link_type: "adsl"
+
+announcer:
+  # Enable mode: "auto", "true", "false"
+  enabled: "auto"
+  # How many chunks to announce ahead
+  lookahead_count: 10
+  # CPU timing safety margin (microseconds)
+  safety_margin_us: 100
+
+receiver:
+  # Maximum wait for missing chunk (ms)
+  reorder_timeout_ms: 50
+  # Maximum buffered chunks per flow
+  max_buffer_chunks: 1000
+  # Forward in-order chunks immediately
+  immediate_forward: true
+
+stats:
+  # EWMA smoothing factor (0.0 - 1.0)
+  ewma_alpha: 0.2
+  # RTT probe frequency (ms)
+  probe_interval_ms: 1000
+  # Window for bandwidth calculation (ms)
+  bandwidth_window_ms: 1000
+
+testing:
+  # Enable A/B testing mode
+  ab_testing_enabled: false
+  # Metrics collection interval (ms)
+  metrics_interval_ms: 1000
+  # Log detailed metrics to file
+  log_metrics: false
+  # Metrics log file path
+  metrics_log_path: "./metrics.jsonl"
+
+logging:
+  # Enable debug logging (runtime toggleable!)
+  debug_enabled: false
+  # Log scheduler decisions (which link selected, why)
+  log_scheduler: false
+  # Log flow classification decisions
+  log_flows: false
+  # Log chunk aggregation details
+  log_chunks: false
+  # Log link statistics updates
+  log_stats: true
+  # Log RTT measurements
+  log_rtt: false
+  # Log file path (empty = stdout only)
+  log_file_path: "./chainlightning.log"
+  # Log rotation size in MB (0 = no rotation)
+  log_rotation_mb: 100
+
+realtime:
+  # UDP ports considered realtime (VoIP, gaming)
+  realtime_udp_ports:
+    - 5060   # SIP
+    - 5061   # SIP TLS
+    - 3478   # STUN
+    - 3479   # TURN
+    - 16384  # RTP range start
+    - 16385
+    - 16386
+    - 16387
+    - 27015  # Steam/gaming
+    - 27016
+    - 27017
+    - 27018
+  # TCP ports considered realtime
+  realtime_tcp_ports:
+    - 22     # SSH
+    - 23     # Telnet
+  # Maximum packet size for realtime classification (bytes)
+  max_realtime_packet_size: 1400
+  # Force realtime traffic to low-latency links only
+  force_adsl_only: true

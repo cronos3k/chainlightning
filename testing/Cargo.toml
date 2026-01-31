@@ -1,0 +1,15 @@
+[package]
+name = "chainlightning_testing"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chainlightning_common = { workspace = true }
+chainlightning_core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+statrs = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name = "chainlightning_core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chainlightning_common = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }

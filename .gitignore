@@ -1,0 +1,26 @@
+# Build artifacts
+target/
+
+# Logs
+*.log
+*.jsonl
+
+# Test output
+ab_results.json
+
+# User config (contains local IPs - use config.example.yaml as template)
+config.yaml
+
+# Internal development plans
+PLAN_*.md
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

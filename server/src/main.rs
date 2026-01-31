@@ -1,0 +1,449 @@
+//! ChainLightning v4 Server
+//!
+//! Server-side of the multi-WAN bonding system.
+//! Runs on the datacenter machine with single high-bandwidth connection.
+//!
+//! Direct UDP mode - binds to 0.0.0.0, learns client NAT addresses.
+//! This binary only works on Linux due to TUN device requirements.
+
+use std::net::{UdpSocket, SocketAddr};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{info, warn, error, debug};
+use tracing_subscriber::{fmt, EnvFilter};
+
+use chainlightning_common::{
+    Config, ConfigManager, MetricsCollector,
+    NUM_LINKS, LINKS, TUN_NAME, TUN_SERVER_IP, TUN_CLIENT_IP, TUN_MTU,
+    protocol::{Packet, ChunkPacket, AnnouncePacket, AckPacket, ProbePacket, now_micros},
+};
+
+/// Tracks learned client addresses for each link
+struct ClientAddresses {
+    addrs: Vec<Option<SocketAddr>>,
+}
+use chainlightning_core::{
+    FlowClassifier, FlowMode,
+    ChunkAggregator, Chunk,
+    LinkScheduler,
+    RateController,
+    ChunkReceiver,
+    StatsCollector,
+    tun::{TunDevice, configure_tun, delete_tun},
+};
+use chainlightning_testing::{TestSuite, create_standard_tests};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logging
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env()
+            .add_directive("chainlightning=info".parse()?)
+            .add_directive("info".parse()?))
+        .init();
+
+    info!("ChainLightning v4 Server starting...");
+
+    // Load or create configuration
+    let config_manager = ConfigManager::new();
+    let config = config_manager.get();
+
+    info!("Configuration loaded:");
+    info!("  Flow classifier: single_link={:.0}%, multi_link={:.0}%",
+        config.flow_classifier.single_link_threshold * 100.0,
+        config.flow_classifier.multi_link_threshold * 100.0);
+    info!("  Chunk size: {}-{} bytes, BDP mult={:.1}",
+        config.chunk_aggregator.min_chunk_size,
+        config.chunk_aggregator.max_chunk_size,
+        config.chunk_aggregator.bdp_multiplier);
+    info!("  Receiver timeout: {}ms", config.receiver.reorder_timeout_ms);
+
+    // Clean up any existing TUN device
+    let _ = delete_tun(TUN_NAME);
+
+    // Create TUN device
+    info!("Creating TUN device {}...", TUN_NAME);
+    let tun = TunDevice::create(TUN_NAME)?;
+    configure_tun(TUN_NAME, TUN_SERVER_IP, TUN_CLIENT_IP, TUN_MTU)?;
+    info!("TUN device {} created with IP {}", TUN_NAME, TUN_SERVER_IP);
+
+    // Create UDP sockets for each link
+    // Direct UDP: bind to 0.0.0.0:port, learn client NAT addresses from incoming packets
+    let mut sockets = Vec::new();
+    for link in LINKS.iter() {
+        let bind_addr = format!("0.0.0.0:{}", link.port);
+        let socket = UdpSocket::bind(&bind_addr)?;
+        socket.set_nonblocking(true)?;
+        info!("Link {}: listening on port {} ({})",
+            link.id, link.port,
+            if link.link_type == chainlightning_common::LinkType::Starlink { "Starlink" } else { "ADSL" });
+        sockets.push(socket);
+    }
+
+    // Track learned client addresses for each link
+    let client_addrs = Arc::new(RwLock::new(ClientAddresses {
+        addrs: vec![None; NUM_LINKS],
+    }));
+
+    // Initialize components with expected DOWNLOAD bandwidths (server sends downstream)
+    let link_bandwidths: Vec<u64> = LINKS.iter()
+        .map(|l| l.expected_bandwidth_down)
+        .collect();
+
+    let flow_classifier = Arc::new(Mutex::new(
+        FlowClassifier::new(config.flow_classifier.clone(), link_bandwidths.clone())
+    ));
+
+    let chunk_aggregator = Arc::new(Mutex::new(
+        ChunkAggregator::new(config.chunk_aggregator.clone(), NUM_LINKS)
+    ));
+
+    // Scheduler uses expected download bandwidths for proportional weighting
+    // ADSL: ~60 Mbps (7.5 MB/s), Starlink: ~220 Mbps (27.5 MB/s)
+    // This means Starlink links should carry ~3.7x more traffic than ADSL
+    // Server sends downloads, so is_upload = false
+    let link_scheduler = Arc::new(Mutex::new(
+        LinkScheduler::new(config.link_scheduler.clone(), &link_bandwidths, false)
+    ));
+
+    info!("Link weights (download): {:?}", link_bandwidths.iter()
+        .map(|&bw| format!("{:.0} Mbps", bw as f64 * 8.0 / 1_000_000.0))
+        .collect::<Vec<_>>());
+
+    let chunk_receiver = Arc::new(Mutex::new(
+        ChunkReceiver::new(config.receiver.clone())
+    ));
+
+    let stats_collector = Arc::new(Mutex::new(
+        StatsCollector::new(NUM_LINKS, config.stats.ewma_alpha, config.stats.bandwidth_window_ms)
+    ));
+
+    let metrics_collector = Arc::new(MetricsCollector::new());
+
+    // Initialize rate controller with download bandwidths
+    let rate_controller = Arc::new(Mutex::new(
+        RateController::new(config.rate_control.clone(), &link_bandwidths)
+    ));
+    info!("Rate control: {}", if config.rate_control.enabled { "ENABLED" } else { "DISABLED (static weights)" });
+
+    // Initialize A/B testing if enabled
+    let test_suite = if config.testing.ab_testing_enabled {
+        let mut suite = TestSuite::new();
+        for test in create_standard_tests() {
+            suite.add_test(test);
+        }
+        Some(Arc::new(Mutex::new(suite)))
+    } else {
+        None
+    };
+
+    info!("All components initialized");
+    info!("Server ready - waiting for client connections...");
+
+    // Channels for inter-task communication
+    let (tx_to_links, mut rx_to_links) = mpsc::channel::<Chunk>(1000);
+    let (tx_from_links, mut rx_from_links) = mpsc::channel::<Chunk>(1000);
+
+    // Spawn TUN reader task (Linux only)
+    #[cfg(target_os = "linux")]
+    {
+        let tun_read_flow_classifier = flow_classifier.clone();
+        let tun_read_aggregator = chunk_aggregator.clone();
+        let _tun_read_scheduler = link_scheduler.clone();
+        let tun_read_metrics = metrics_collector.clone();
+        let tun_fd = tun.raw_fd();
+        let tx_to_links = tx_to_links.clone();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2000];
+            loop {
+                // Non-blocking read from TUN
+                let n = unsafe {
+                    libc::read(tun_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+
+                if n > 0 {
+                    let packet = &buf[..n as usize];
+
+                    // Classify flow
+                    let _mode = tun_read_flow_classifier.lock().unwrap().classify(packet);
+
+                    // Get flow ID
+                    let flow_id = chainlightning_common::protocol::FlowId::from_packet(packet);
+
+                    // Aggregate into chunk
+                    let chunk = tun_read_aggregator.lock().unwrap().add_packet(packet, flow_id);
+                    if let Some(chunk) = chunk {
+                        // Send chunk to link tasks
+                        let _ = tx_to_links.send(chunk).await;
+                    }
+
+                    // Record metrics
+                    tun_read_metrics.record_packet_tx(n as usize);
+                } else {
+                    // No data, brief sleep
+                    tokio::time::sleep(Duration::from_micros(100)).await;
+                }
+            }
+        });
+    }
+
+    // Spawn TUN writer task (Linux only)
+    #[cfg(target_os = "linux")]
+    {
+        let _tun_write_receiver = chunk_receiver.clone();
+        let tun_write_metrics = metrics_collector.clone();
+        let tun_fd = tun.raw_fd();
+
+        tokio::spawn(async move {
+            let mut rx = rx_from_links;
+            while let Some(chunk) = rx.recv().await {
+                // Extract packets from chunk and write to TUN
+                for packet in chunk.extract_packets() {
+                    unsafe {
+                        libc::write(tun_fd, packet.as_ptr() as *const libc::c_void, packet.len());
+                    }
+                    tun_write_metrics.record_packet_rx(packet.len());
+                }
+            }
+        });
+    }
+
+    // Spawn link receiver tasks (one per link)
+    for (link_id, socket) in sockets.iter().enumerate() {
+        let socket = socket.try_clone()?;
+        let receiver = chunk_receiver.clone();
+        let stats = stats_collector.clone();
+        let metrics = metrics_collector.clone();
+        let rc = rate_controller.clone();
+        let tx = tx_from_links.clone();
+        let addrs = client_addrs.clone();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 65536];
+            loop {
+                match socket.recv_from(&mut buf) {
+                    Ok((n, client_addr)) => {
+                        // Learn/update client's NAT address for this link
+                        {
+                            let mut addrs_guard = addrs.write().unwrap();
+                            let old_addr = addrs_guard.addrs[link_id];
+                            if old_addr != Some(client_addr) {
+                                info!("Link {}: learned client address {}", link_id, client_addr);
+                                addrs_guard.addrs[link_id] = Some(client_addr);
+                            }
+                        }
+
+                        if let Some(packet) = Packet::decode(&buf[..n]) {
+                            match packet {
+                                Packet::Data(chunk_pkt) => {
+                                    // Record stats
+                                    stats.lock().unwrap().record_rx(link_id, n);
+                                    metrics.record_chunk_rx(chunk_pkt.payload.len());
+                                    rc.lock().unwrap().record_rx(link_id, n);
+
+                                    // Convert to Chunk and send to receiver
+                                    let mut chunk = Chunk::new(chunk_pkt.chunk_id);
+                                    chunk.data = chunk_pkt.payload;
+
+                                    let _ = tx.send(chunk).await;
+
+                                    // Send ACK back to client's address
+                                    let ack = AckPacket {
+                                        chunk_id: chunk_pkt.chunk_id,
+                                        link_id: link_id as u8,
+                                        echo_timestamp_us: 0,
+                                        recv_timestamp_us: now_micros(),
+                                    };
+                                    let _ = socket.send_to(&ack.encode(), client_addr);
+                                }
+                                Packet::Announce(ann) => {
+                                    receiver.lock().unwrap().handle_announcement(ann);
+                                }
+                                Packet::Ack(ack) => {
+                                    // Calculate RTT
+                                    let now = now_micros();
+                                    if ack.echo_timestamp_us > 0 && now > ack.echo_timestamp_us {
+                                        let rtt = now - ack.echo_timestamp_us;
+                                        stats.lock().unwrap().record_rtt(link_id, rtt);
+                                    }
+                                }
+                                Packet::Probe(probe) => {
+                                    // Process probe for rate control
+                                    rc.lock().unwrap().process_probe(&probe);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_micros(100)).await;
+                    }
+                    Err(e) => {
+                        warn!("Link {} recv error: {}", link_id, e);
+                    }
+                }
+            }
+        });
+    }
+
+    // Spawn chunk sender task
+    let sockets_clone: Vec<_> = sockets.iter().map(|s| s.try_clone().unwrap()).collect();
+    let sender_scheduler = link_scheduler.clone();
+    let sender_stats = stats_collector.clone();
+    let sender_metrics = metrics_collector.clone();
+    let sender_addrs = client_addrs.clone();
+    let sender_rc = rate_controller.clone();
+
+    tokio::spawn(async move {
+        let mut rx = rx_to_links;
+        while let Some(chunk) = rx.recv().await {
+            // Schedule chunk
+            // Use single-link mode: pick fastest link by measured bandwidth
+            // This avoids TCP reordering issues when distributing across heterogeneous links
+            let decision = sender_scheduler.lock().unwrap().schedule(chunk.size(), false);
+
+            // Encode chunk
+            let chunk_pkt = ChunkPacket {
+                chunk_id: chunk.id,
+                link_id: decision.link_id as u8,
+                total_size: chunk.size() as u32,
+                offset: 0,
+                payload: chunk.data.clone(),
+            };
+            let encoded = chunk_pkt.encode();
+
+            // Send on selected link - use learned client address
+            if let Some(socket) = sockets_clone.get(decision.link_id) {
+                let client_addr = sender_addrs.read().unwrap().addrs[decision.link_id];
+                if let Some(addr) = client_addr {
+                    if let Err(e) = socket.send_to(&encoded, addr) {
+                        warn!("Link {} send error: {}", decision.link_id, e);
+                    } else {
+                        sender_stats.lock().unwrap().record_tx(decision.link_id, encoded.len());
+                        sender_metrics.record_chunk_tx(chunk.size());
+                        sender_rc.lock().unwrap().record_tx(decision.link_id, encoded.len());
+                    }
+                } else {
+                    // No client address learned yet, skip this link
+                    debug!("Link {} has no client address yet, skipping", decision.link_id);
+                }
+            }
+        }
+    });
+
+    // Spawn aggregation timeout checker
+    let timeout_aggregator = chunk_aggregator.clone();
+    let timeout_tx = tx_to_links;
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            interval.tick().await;
+            let chunk = timeout_aggregator.lock().unwrap().check_timeout();
+            if let Some(chunk) = chunk {
+                let _ = timeout_tx.send(chunk).await;
+            }
+        }
+    });
+
+    // Spawn stats update task
+    let stats_updater = stats_collector.clone();
+    let metrics_updater = metrics_collector.clone();
+    let scheduler_updater = link_scheduler.clone();
+    let aggregator_updater = chunk_aggregator.clone();
+    let rc_updater = rate_controller.clone();
+    let rc_enabled = config.rate_control.enabled;
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut log_counter = 0u32;
+        loop {
+            interval.tick().await;
+            log_counter += 1;
+
+            // Update stats
+            stats_updater.lock().unwrap().tick();
+
+            // Get current stats
+            let stats = stats_updater.lock().unwrap();
+            let bandwidths = stats.bandwidths();
+            let rtts = stats.rtts();
+            let _total_bw = stats.total_bandwidth();
+
+            info!("{}", stats.summary());
+
+            // Update scheduler with new bandwidths (adaptive algorithm)
+            drop(stats);
+            for (i, (&bw, &rtt)) in bandwidths.iter().zip(rtts.iter()).enumerate() {
+                scheduler_updater.lock().unwrap().update_link(i, bw, rtt, true);
+                aggregator_updater.lock().unwrap().update_link_stats(i, bw, (rtt / 1000) as u32);
+            }
+
+            // Rate control: check timeouts and push weights
+            if rc_enabled {
+                let mut rc = rc_updater.lock().unwrap();
+                rc.check_timeouts();
+                let weights = rc.weights();
+                drop(rc);
+                scheduler_updater.lock().unwrap().set_rate_controlled_weights(&weights);
+            }
+
+            // Log status every 5 seconds
+            if log_counter % 5 == 0 {
+                let scheduler = scheduler_updater.lock().unwrap();
+                info!("Scheduler: {}", scheduler.status_summary());
+                drop(scheduler);
+                if rc_enabled {
+                    let rc = rc_updater.lock().unwrap();
+                    info!("{}", rc.status_summary());
+                }
+            }
+
+            // Take metrics snapshot
+            let snapshot = metrics_updater.snapshot();
+            debug!(
+                "Metrics: {:.1} Mbps down, {:.1} Mbps up, p50={:.1}ms",
+                snapshot.throughput_down_mbps,
+                snapshot.throughput_up_mbps,
+                snapshot.latency_p50_us as f64 / 1000.0
+            );
+        }
+    });
+
+    // Spawn probe sender task (rate control) - uses send_to with learned addresses
+    if config.rate_control.enabled {
+        let probe_sockets: Vec<_> = sockets.iter().map(|s| s.try_clone().unwrap()).collect();
+        let probe_rc = rate_controller.clone();
+        let probe_addrs = client_addrs.clone();
+        let probe_interval = config.rate_control.probe_interval_ms;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(probe_interval));
+            loop {
+                interval.tick().await;
+                let probes = probe_rc.lock().unwrap().build_probes();
+                for probe in &probes {
+                    let link_id = probe.link_id as usize;
+                    if let Some(socket) = probe_sockets.get(link_id) {
+                        // Server uses send_to with learned client address
+                        let client_addr = probe_addrs.read().unwrap().addrs[link_id];
+                        if let Some(addr) = client_addr {
+                            let _ = socket.send_to(&probe.encode(), addr);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Wait forever
+    info!("Server running. Press Ctrl+C to stop.");
+    tokio::signal::ctrl_c().await?;
+
+    info!("Shutting down...");
+    let _ = delete_tun(TUN_NAME);
+
+    Ok(())
+}
