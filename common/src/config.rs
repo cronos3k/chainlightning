@@ -337,8 +337,8 @@ impl Default for Config {
                 realtime_window_ms: 1000,
             },
             chunk_aggregator: ChunkAggregatorConfig {
-                min_chunk_size: 1400,         // MTU-sized - don't wait for large chunks
-                max_chunk_size: 65536,        // 64 KB max (was 1 MB - too large)
+                min_chunk_size: 1200,         // Allow small-packet aggregation
+                max_chunk_size: 1400,         // MTU-safe: one chunk = one UDP datagram, no IP fragmentation
                 bdp_multiplier: 1.0,
                 aggregation_timeout_ms: 5,    // 5ms max wait (was 50ms - too slow for TCP)
             },
