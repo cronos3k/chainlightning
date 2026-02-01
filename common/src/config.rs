@@ -410,7 +410,7 @@ impl Default for Config {
             receiver: ReceiverConfig {
                 reorder_timeout_ms: 25,       // 25ms — covers 11ms one-way spread of 4-link group + jitter margin
                 max_buffer_chunks: 10000,     // Hold up to 10K chunks during reorder window
-                immediate_forward: false,     // Use ordered reassembly; per-chunk mode handles bypass
+                immediate_forward: true,      // Skip reorder buffer; per-chunk mode tags handle routing
             },
             stats: StatsConfig {
                 ewma_alpha: 0.2,
