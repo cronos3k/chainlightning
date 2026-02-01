@@ -108,11 +108,38 @@ impl ReassemblyBuffer {
     }
 
     /// Get all ready chunks using per-chunk mode-aware forwarding:
+    /// - immediate_forward=true: forward ALL chunks immediately (bypass reorder buffer entirely)
     /// - Realtime/SingleLink chunks: immediate forward (bypass reorder buffer)
     /// - Late-arriving chunks (id < next_expected): immediate forward (better late than lost)
     /// - Bulk chunks: ordered delivery with reorder timeout
     pub fn drain_ready(&mut self) -> Vec<Chunk> {
         let mut ready = Vec::new();
+
+        // Fast path: when immediate_forward is enabled, forward ALL ready chunks
+        // regardless of flow_mode. This avoids reorder buffer head-of-line blocking
+        // that kills throughput when Bulk-tagged chunks arrive out of order.
+        if self.config.immediate_forward {
+            let all_ready_ids: Vec<u64> = self.slots.iter()
+                .filter(|(_, slot)| slot.is_ready())
+                .map(|(id, _)| *id)
+                .collect();
+
+            for id in all_ready_ids {
+                if let Some(mut slot) = self.slots.remove(&id) {
+                    if let Some(chunk) = slot.chunk.take() {
+                        ready.push(chunk);
+                        self.chunks_forwarded += 1;
+                    }
+                }
+                if id >= self.next_expected {
+                    self.next_expected = id + 1;
+                }
+            }
+
+            self.prune_old_slots();
+            return ready;
+        }
+
         let timeout = Duration::from_millis(self.config.reorder_timeout_ms);
 
         // Pass 1: Immediately forward chunks that bypass reorder:
