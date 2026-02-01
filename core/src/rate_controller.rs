@@ -72,11 +72,16 @@ struct RateState {
     probe_seq: u32,
     /// Last timestamp we received from remote (echoed back for RTT)
     last_remote_timestamp_us: u64,
+    /// When we received the probe whose timestamp we're echoing (for echo_delay_us)
+    last_remote_recv_us: u64,
 
     /// Timestamp of last sent probe
     last_probe_sent_us: u64,
     /// Timestamp of last received probe
     last_probe_recv: Instant,
+
+    /// Timestamp of last process_probe call (for aligned interval calculation)
+    last_process_probe_us: u64,
 
     /// Recovery probe counter (for DOWN->PROBING->RUNNING)
     recovery_count: u32,
@@ -121,8 +126,10 @@ impl RateState {
             last_loss_rx_packets: 0,
             probe_seq: 0,
             last_remote_timestamp_us: 0,
+            last_remote_recv_us: 0,
             last_probe_sent_us: 0,
             last_probe_recv: Instant::now(),
+            last_process_probe_us: 0,
             recovery_count: 0,
             probe_confidence: 1.0,
             prev_probe_confidence: 1.0,
@@ -156,6 +163,13 @@ impl RateState {
         self.last_probe_rx_bytes = self.total_rx_bytes;
         self.last_probe_rx_packets = self.total_rx_packets;
 
+        // How long we held the echoed timestamp before sending this probe
+        let echo_delay = if self.last_remote_recv_us > 0 {
+            now.saturating_sub(self.last_remote_recv_us)
+        } else {
+            0
+        };
+
         ProbePacket {
             link_id: self.link_id as u8,
             seq: self.probe_seq,
@@ -167,6 +181,7 @@ impl RateState {
             rx_packets,
             loss_ratio: self.loss,
             path_state: self.state,
+            echo_delay_us: echo_delay,
         }
     }
 
@@ -312,14 +327,17 @@ impl RateController {
         let now = now_micros();
         state.last_probe_recv = Instant::now();
         state.last_remote_timestamp_us = probe.timestamp_us;
+        state.last_remote_recv_us = now;
 
         // Update TAPA confidence
         state.prev_probe_confidence = state.probe_confidence;
         state.probe_confidence = confidence;
 
         // === 1. RTT measurement (unaffected by TAPA) ===
+        // Subtract echo_delay_us: the time the remote held our timestamp before echoing it.
+        // This removes the scheduling delay from the measured RTT.
         if probe.echo_timestamp_us > 0 && now > probe.echo_timestamp_us {
-            let rtt = now - probe.echo_timestamp_us;
+            let rtt = (now - probe.echo_timestamp_us).saturating_sub(probe.echo_delay_us);
             if state.srtt_us == 0 {
                 state.srtt_us = rtt;
                 state.rtt_var_us = rtt / 2;
@@ -339,21 +357,16 @@ impl RateController {
             // Normal probe-based congestion detection
             let remote_rx_bytes = probe.rx_bytes;
 
-            // Compute our TX bytes in current interval (from cumulative counters)
-            let our_interval_tx = state.total_tx_bytes - state.last_probe_tx_bytes
-                + (state.last_probe_tx_bytes - state.last_probe_tx_bytes); // current delta
-            // Use a simple estimate: our recent TX rate
-            let our_tx_rate = if tx_dt > 0 {
-                // Use the delta that was last reported in build_probe
-                // Since we haven't called build_probe yet, use cumulative - last_probe snapshot
-                let delta = state.total_tx_bytes.saturating_sub(state.last_probe_tx_bytes);
-                if delta > 0 {
-                    delta * 1_000_000 / tx_dt
-                } else {
-                    state.tx_rate
-                }
+            // Compute our ACTUAL TX bytes in current interval (from cumulative counters)
+            // CRITICAL: Only use real data delta. When delta==0, no data was sent,
+            // so congestion detection is meaningless. Previously, falling back to
+            // state.tx_rate caused false congestion detection on idle links because
+            // the "allowed rate" was compared against tiny probe-only rx_bytes.
+            let tx_delta = state.total_tx_bytes.saturating_sub(state.last_probe_tx_bytes);
+            let our_tx_rate = if tx_dt > 0 && tx_delta > 0 {
+                tx_delta * 1_000_000 / tx_dt
             } else {
-                state.tx_rate
+                0 // No actual data sent → cannot measure congestion
             };
 
             let remote_rx_rate = if tx_dt > 0 {
@@ -372,8 +385,8 @@ impl RateController {
                     let new_rate = state.tx_rate.saturating_add(growth);
                     apply_rate_change(state, new_rate, &self.config);
                 }
-            } else if our_tx_rate == 0 && remote_rx_rate == 0 {
-                // No traffic - gentle growth towards max
+            } else {
+                // No data traffic (or one-sided) - grow towards max
                 let growth = (state.tx_rate as f64 * self.config.growth_factor) as u64;
                 let new_rate = state.tx_rate.saturating_add(growth);
                 apply_rate_change(state, new_rate, &self.config);
@@ -391,27 +404,53 @@ impl RateController {
             // If no data flowing AND low confidence, hold rate steady
         }
 
-        // === 3. Directional Loss Detection (with TAPA gating) ===
-        // Snapshot our own counters for this loss calculation cycle
+        // === 3. Directional Loss Detection (with time-normalized deltas + TAPA gating) ===
+        //
+        // KEY FIX: The remote's packet deltas cover [remote_last_build, remote_this_build]
+        // (~probe_interval_ms), while our deltas cover [our_last_process, our_this_process]
+        // (variable, depends on probe arrival timing). At high throughput this mismatch
+        // causes phantom loss. Fix: scale remote's deltas to match our measurement window.
+
+        // Snapshot our own counters
         let our_tx_delta = state.total_tx_packets - state.last_loss_tx_packets;
         let our_rx_delta = state.total_rx_packets - state.last_loss_rx_packets;
         state.last_loss_tx_packets = state.total_tx_packets;
         state.last_loss_rx_packets = state.total_rx_packets;
 
+        // Compute our actual interval since last process_probe (microseconds)
+        let our_interval_us = if state.last_process_probe_us > 0 {
+            now.saturating_sub(state.last_process_probe_us)
+        } else {
+            0
+        };
+        state.last_process_probe_us = now;
+
+        // Remote's nominal probe interval
+        let remote_interval_us = self.config.probe_interval_ms * 1000;
+
         // Gate factor: scale accumulation by probe confidence
         let gate = if self.config.tapa_enabled { confidence } else { 1.0 };
 
-        // SENDING direction (us -> remote):
-        //   What we sent: our_tx_delta (our local TX count)
-        //   What remote received from us: probe.rx_packets
-        state.send_tx_acc += (our_tx_delta as f64 * gate) as u64;
-        state.send_rx_acc += (probe.rx_packets as f64 * gate) as u64;
+        // Only compute loss when we have valid intervals (skip first probe)
+        if our_interval_us > 10_000 && remote_interval_us > 0 {
+            // Scale factor: adjust remote's deltas to cover our interval duration
+            // e.g., if our interval is 150ms and remote's is 200ms, scale = 0.75
+            let scale = (our_interval_us as f64 / remote_interval_us as f64).clamp(0.2, 5.0);
 
-        // RECEIVING direction (remote -> us):
-        //   What remote sent to us: probe.tx_packets
-        //   What we received: our_rx_delta (our local RX count)
-        state.recv_tx_acc += (probe.tx_packets as f64 * gate) as u64;
-        state.recv_rx_acc += (our_rx_delta as f64 * gate) as u64;
+            // SENDING direction (us -> remote):
+            //   What we sent: our_tx_delta (covers our_interval)
+            //   What remote received from us: probe.rx_packets (covers remote_interval, scale to ours)
+            let scaled_remote_rx = (probe.rx_packets as f64 * scale) as u64;
+            state.send_tx_acc += (our_tx_delta as f64 * gate) as u64;
+            state.send_rx_acc += (scaled_remote_rx as f64 * gate) as u64;
+
+            // RECEIVING direction (remote -> us):
+            //   What remote sent to us: probe.tx_packets (covers remote_interval, scale to ours)
+            //   What we received: our_rx_delta (covers our_interval)
+            let scaled_remote_tx = (probe.tx_packets as f64 * scale) as u64;
+            state.recv_tx_acc += (scaled_remote_tx as f64 * gate) as u64;
+            state.recv_rx_acc += (our_rx_delta as f64 * gate) as u64;
+        }
 
         // Calculate SENDING direction loss
         if state.send_tx_acc > self.config.loss_min_packets {
@@ -420,9 +459,9 @@ impl RateController {
             } else {
                 0
             };
-            // 15/16 decay
-            state.send_tx_acc -= state.send_tx_acc / 16;
-            state.send_rx_acc -= state.send_rx_acc / 16;
+            // 7/8 decay (faster recovery than 15/16)
+            state.send_tx_acc -= state.send_tx_acc / 8;
+            state.send_rx_acc -= state.send_rx_acc / 8;
         }
 
         // Calculate RECEIVING direction loss
@@ -432,9 +471,9 @@ impl RateController {
             } else {
                 0
             };
-            // 15/16 decay
-            state.recv_tx_acc -= state.recv_tx_acc / 16;
-            state.recv_rx_acc -= state.recv_rx_acc / 16;
+            // 7/8 decay (faster recovery than 15/16)
+            state.recv_tx_acc -= state.recv_tx_acc / 8;
+            state.recv_rx_acc -= state.recv_rx_acc / 8;
         }
 
         // Effective loss = worst direction
@@ -667,9 +706,22 @@ mod tests {
     #[test]
     fn test_directional_loss_no_phantom_on_asymmetric_traffic() {
         // KEY TEST: Upload-only traffic should NOT cause phantom loss
-        let config = test_config();
+        let mut config = test_config();
+        config.probe_interval_ms = 20; // Match test sleep cadence (~15ms)
         let rates = vec![7_500_000u64]; // 60 Mbps
         let mut rc = RateController::new(config, &rates);
+
+        // Baseline probe to initialize timing
+        let probe0 = ProbePacket {
+            link_id: 0, seq: 0, timestamp_us: now_micros() - 400_000,
+            echo_timestamp_us: 0, tx_bytes: 0, tx_packets: 0,
+            rx_bytes: 0, rx_packets: 0, loss_ratio: 0,
+            path_state: PathState::Running, echo_delay_us: 0,
+        };
+        rc.process_probe(&probe0);
+
+        // Sleep to create valid interval for loss computation
+        std::thread::sleep(std::time::Duration::from_millis(15));
 
         // Simulate heavy upload: lots of TX, minimal RX
         for _ in 0..100 {
@@ -694,6 +746,7 @@ mod tests {
             rx_packets: 95,       // Remote received 95 of our 100 packets
             loss_ratio: 0,
             path_state: PathState::Running,
+            echo_delay_us: 0,
         };
 
         rc.process_probe(&probe);
@@ -746,6 +799,7 @@ mod tests {
         // When confidence is low, loss accumulation should be slowed
         let mut config = test_config();
         config.loss_min_packets = 10; // Lower threshold for test
+        config.probe_interval_ms = 20; // Match test sleep cadence (~15ms)
         let rates = vec![1_000_000u64];
         let mut rc = RateController::new(config, &rates);
 
@@ -755,7 +809,7 @@ mod tests {
             rc.record_tx(0, 100);
         }
         let _ = rc.build_probes();
-        // Process a neutral probe to set last_loss_tx_packets
+        // Process a neutral probe to set last_loss_tx_packets and timing baseline
         let probe0 = ProbePacket {
             link_id: 0,
             seq: 0,
@@ -767,9 +821,13 @@ mod tests {
             rx_packets: 5,
             loss_ratio: 0,
             path_state: PathState::Running,
+            echo_delay_us: 0,
         };
         rc.process_probe(&probe0);
         assert_eq!(rc.link_state(0), PathState::Running, "Baseline should be Running");
+
+        // Sleep to create valid interval for loss computation
+        std::thread::sleep(std::time::Duration::from_millis(15));
 
         // === Cycle 1: Heavy traffic ===
         let _ = rc.build_probes(); // Reset probe snapshots
@@ -789,6 +847,7 @@ mod tests {
             rx_packets: 195,  // Received 195 of our 200
             loss_ratio: 0,
             path_state: PathState::Running,
+            echo_delay_us: 0,
         };
 
         rc.process_probe(&probe1);
@@ -839,6 +898,7 @@ mod tests {
             rx_packets: 0,
             loss_ratio: 0,
             path_state: PathState::Running,
+            echo_delay_us: 0,
         };
 
         rc.process_probe(&probe);
@@ -858,12 +918,16 @@ mod tests {
         // Ensure TAPA doesn't mask real loss on idle links
         let mut config = test_config();
         config.loss_min_packets = 50;
+        config.probe_interval_ms = 20; // Match test sleep cadence (~15ms)
         let rates = vec![7_500_000u64];
         let mut rc = RateController::new(config, &rates);
 
         // Simulate real loss on idle link: we send packets, remote receives few
-        // Run multiple probe cycles to accumulate enough
+        // Run multiple probe cycles with real intervals for time-normalized loss detection
         for cycle in 0..20 {
+            // Sleep to create valid interval between probes
+            std::thread::sleep(std::time::Duration::from_millis(15));
+
             // We send some data each cycle
             for _ in 0..10 {
                 rc.record_tx(0, 1000);
@@ -880,6 +944,7 @@ mod tests {
                 rx_packets: 2,   // Remote only received 2 of our 10 (80% loss)
                 loss_ratio: 0,
                 path_state: PathState::Running,
+                echo_delay_us: 0,
             };
 
             rc.process_probe(&probe);

@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use chainlightning_common::config::ChunkAggregatorConfig;
 use chainlightning_common::protocol::{ChunkId, FlowId};
+use crate::flow_classifier::FlowMode;
 
 /// A chunk of aggregated packets
 #[derive(Debug, Clone)]
@@ -15,6 +16,8 @@ pub struct Chunk {
     pub id: ChunkId,
     /// Flow ID (if single-flow chunk) or None for aggregated
     pub flow_id: Option<FlowId>,
+    /// Flow routing mode for this chunk
+    pub flow_mode: FlowMode,
     /// Aggregated packet data
     pub data: Vec<u8>,
     /// Individual packet boundaries (offsets within data)
@@ -31,6 +34,7 @@ impl Chunk {
         Self {
             id,
             flow_id: None,
+            flow_mode: FlowMode::SingleLink { link_id: 0 },
             data: Vec::new(),
             packet_offsets: Vec::new(),
             created_at: Instant::now(),
@@ -152,7 +156,19 @@ impl ChunkAggregator {
 
     /// Add a packet to be aggregated
     /// Returns Some(Chunk) if a chunk is ready to send
-    pub fn add_packet(&mut self, packet: &[u8], flow_id: Option<FlowId>) -> Option<Chunk> {
+    pub fn add_packet(&mut self, packet: &[u8], flow_id: Option<FlowId>, flow_mode: FlowMode) -> Option<Chunk> {
+        // Realtime mode: flush immediately as single-packet chunk, no batching
+        if matches!(flow_mode, FlowMode::Realtime { .. }) {
+            // If there's pending data in current chunk, DON'T flush it yet —
+            // just create a new immediate chunk for this realtime packet
+            let mut rt_chunk = Chunk::new(self.next_chunk_id);
+            self.next_chunk_id = self.next_chunk_id.next();
+            rt_chunk.add_packet(packet);
+            rt_chunk.flow_id = flow_id;
+            rt_chunk.flow_mode = flow_mode;
+            return Some(rt_chunk);
+        }
+
         // Check if adding this packet would exceed chunk size
         let new_size = self.current_chunk.size() + 2 + packet.len(); // 2 bytes for length prefix
 
@@ -160,6 +176,7 @@ impl ChunkAggregator {
             // Current chunk is full - finalize and start new one
             let ready_chunk = self.finalize_current_chunk();
             self.current_chunk.add_packet(packet);
+            self.current_chunk.flow_mode = flow_mode;
             if flow_id.is_some() {
                 self.current_chunk.flow_id = flow_id;
             }
@@ -168,6 +185,7 @@ impl ChunkAggregator {
 
         // Add to current chunk
         self.current_chunk.add_packet(packet);
+        self.current_chunk.flow_mode = flow_mode;
         if flow_id.is_some() && self.current_chunk.flow_id.is_none() {
             self.current_chunk.flow_id = flow_id;
         }
@@ -264,18 +282,39 @@ mod tests {
         };
 
         let mut agg = ChunkAggregator::new(config, 5);
+        let mode = FlowMode::SingleLink { link_id: 0 };
 
         // Add small packets - should accumulate
         for _ in 0..5 {
-            let result = agg.add_packet(&[0u8; 10], None);
+            let result = agg.add_packet(&[0u8; 10], None, mode);
             assert!(result.is_none());
         }
 
         // Add large packet to trigger flush
-        let result = agg.add_packet(&[0u8; 80], None);
+        let result = agg.add_packet(&[0u8; 80], None, mode);
         assert!(result.is_some());
 
         let chunk = result.unwrap();
         assert_eq!(chunk.packet_count(), 5);
+    }
+
+    #[test]
+    fn test_realtime_immediate_flush() {
+        let config = ChunkAggregatorConfig {
+            min_chunk_size: 100,
+            max_chunk_size: 1000,
+            bdp_multiplier: 1.0,
+            aggregation_timeout_ms: 50,
+        };
+
+        let mut agg = ChunkAggregator::new(config, 5);
+        let rt_mode = FlowMode::Realtime { link_id: 2 };
+
+        // Realtime packet should flush immediately
+        let result = agg.add_packet(&[0u8; 50], None, rt_mode);
+        assert!(result.is_some());
+        let chunk = result.unwrap();
+        assert_eq!(chunk.packet_count(), 1);
+        assert!(matches!(chunk.flow_mode, FlowMode::Realtime { link_id: 2 }));
     }
 }

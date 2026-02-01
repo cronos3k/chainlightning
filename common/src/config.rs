@@ -57,6 +57,12 @@ pub struct FlowClassifierConfig {
 
     /// Flow expiry timeout (ms) - remove inactive flows
     pub flow_expiry_ms: u64,
+
+    /// Packets/sec threshold for realtime cadence detection
+    pub realtime_pps_threshold: u32,
+
+    /// Sampling window for cadence detection (ms)
+    pub realtime_window_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,9 +305,9 @@ impl Default for RateControlConfig {
             congestion_threshold: 0.125,
             congestion_reduction: 0.875,
             growth_factor: 0.10,
-            loss_min_packets: 1000,
-            loss_threshold: 5,
-            loss_down_threshold: 200,
+            loss_min_packets: 3000,
+            loss_threshold: 20,
+            loss_down_threshold: 230,
             down_timeout_ms: 5000,
             probe_recovery_count: 3,
             rtt_ewma_alpha: 0.125,
@@ -327,6 +333,8 @@ impl Default for Config {
                 monitor_duration_ms: 2000,
                 flow_window_ms: 1000,
                 flow_expiry_ms: 30000,
+                realtime_pps_threshold: 10,
+                realtime_window_ms: 1000,
             },
             chunk_aggregator: ChunkAggregatorConfig {
                 min_chunk_size: 1400,         // MTU-sized - don't wait for large chunks
@@ -337,7 +345,7 @@ impl Default for Config {
             link_scheduler: LinkSchedulerConfig {
                 sync_interval_ms: 50,
                 max_send_delay_ms: 100,
-                enable_sync: true,
+                enable_sync: false,  // Sync delay is applied serially in sender loop, blocking all sends
                 strategy: "tiered_fill".to_string(),
                 link_tiers: vec![
                     // L2 = ADSL2 - BEST latency, priority 1
@@ -400,9 +408,9 @@ impl Default for Config {
                 safety_margin_us: 100,
             },
             receiver: ReceiverConfig {
-                reorder_timeout_ms: 50,       // 50ms max wait (was 100ms)
-                max_buffer_chunks: 1000,
-                immediate_forward: true,
+                reorder_timeout_ms: 25,       // 25ms — covers 11ms one-way spread of 4-link group + jitter margin
+                max_buffer_chunks: 10000,     // Hold up to 10K chunks during reorder window
+                immediate_forward: false,     // Use ordered reassembly; per-chunk mode handles bypass
             },
             stats: StatsConfig {
                 ewma_alpha: 0.2,
@@ -437,7 +445,7 @@ impl Default for Config {
                     22,               // SSH
                     23,               // Telnet
                 ],
-                max_realtime_packet_size: 1400,  // Small packets only
+                max_realtime_packet_size: 600,   // VoIP ~160-320B, gaming ~64-256B, DNS ~60-512B
                 force_adsl_only: true,           // Keep realtime on stable links
             },
             rate_control: RateControlConfig::default(),

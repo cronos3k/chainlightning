@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use chainlightning_common::config::ReceiverConfig;
 use chainlightning_common::protocol::AnnouncePacket;
 use crate::chunk_aggregator::Chunk;
+use crate::flow_classifier::FlowMode;
 
 /// Reassembly buffer slot
 #[derive(Debug)]
@@ -19,6 +20,8 @@ struct BufferSlot {
     announcement: Option<AnnouncePacket>,
     /// Expected link
     expected_link: Option<usize>,
+    /// Flow mode from wire (determines forwarding strategy)
+    flow_mode: Option<FlowMode>,
     /// When slot was created
     created_at: Instant,
     /// Has been forwarded
@@ -31,6 +34,7 @@ impl BufferSlot {
             chunk: None,
             announcement: None,
             expected_link: None,
+            flow_mode: None,
             created_at: Instant::now(),
             forwarded: false,
         }
@@ -88,8 +92,8 @@ impl ReassemblyBuffer {
         slot.expected_link = Some(ann.link_id as usize);
     }
 
-    /// Store received chunk
-    pub fn store_chunk(&mut self, chunk: Chunk) {
+    /// Store received chunk with flow mode from wire
+    pub fn store_chunk(&mut self, chunk: Chunk, flow_mode: FlowMode) {
         let id = chunk.id.0;
 
         // Update tracking
@@ -99,72 +103,97 @@ impl ReassemblyBuffer {
         self.chunks_received += 1;
 
         let slot = self.slots.entry(id).or_insert_with(BufferSlot::new);
+        slot.flow_mode = Some(flow_mode);
         slot.chunk = Some(chunk);
     }
 
-    /// Get all ready chunks (non-blocking, returns whatever is available)
-    /// This is the key difference from v3 - we don't wait for in-order
+    /// Get all ready chunks using per-chunk mode-aware forwarding:
+    /// - Realtime/SingleLink chunks: immediate forward (bypass reorder buffer)
+    /// - Late-arriving chunks (id < next_expected): immediate forward (better late than lost)
+    /// - Bulk chunks: ordered delivery with reorder timeout
     pub fn drain_ready(&mut self) -> Vec<Chunk> {
         let mut ready = Vec::new();
         let timeout = Duration::from_millis(self.config.reorder_timeout_ms);
 
-        // First, forward any chunks that are ready
-        if self.config.immediate_forward {
-            // Forward in any order - prioritize by ID to maintain some ordering
-            let ready_ids: Vec<u64> = self.slots.iter()
-                .filter(|(_, slot)| slot.is_ready())
-                .map(|(id, _)| *id)
-                .collect();
+        // Pass 1: Immediately forward chunks that bypass reorder:
+        //   a) Realtime/SingleLink tagged chunks
+        //   b) Late-arriving chunks (id < next_expected) — deliver rather than drop
+        let bypass_ids: Vec<u64> = self.slots.iter()
+            .filter(|(id, slot)| {
+                if !slot.is_ready() { return false; }
+                // Bypass for Realtime/SingleLink
+                match slot.flow_mode {
+                    Some(FlowMode::Realtime { .. }) | Some(FlowMode::SingleLink { .. }) => return true,
+                    _ => {}
+                }
+                // Bypass for late arrivals (already past next_expected)
+                if **id < self.next_expected {
+                    return true;
+                }
+                false
+            })
+            .map(|(id, _)| *id)
+            .collect();
 
-            for id in ready_ids {
+        for id in bypass_ids {
+            if let Some(mut slot) = self.slots.remove(&id) {
+                if let Some(chunk) = slot.chunk.take() {
+                    ready.push(chunk);
+                    self.chunks_forwarded += 1;
+                }
+            }
+            // Only advance next_expected for sequential bypass, never backward
+            if id == self.next_expected {
+                self.next_expected = id + 1;
+            }
+        }
+
+        // Pass 2: Ordered delivery for Bulk chunks
+        while let Some((&id, slot)) = self.slots.first_key_value() {
+            // Safety: skip any chunks behind next_expected (shouldn't happen after Pass 1, but be safe)
+            if id < self.next_expected {
+                if let Some(mut slot) = self.slots.remove(&id) {
+                    if let Some(chunk) = slot.chunk.take() {
+                        ready.push(chunk);
+                        self.chunks_forwarded += 1;
+                    }
+                } else {
+                    self.slots.remove(&id);
+                }
+                continue;
+            }
+
+            // Gap detection: id > next_expected means chunks are missing
+            if id > self.next_expected {
+                if slot.is_timed_out(timeout) {
+                    let skipped = id - self.next_expected;
+                    self.chunks_timeout += skipped;
+                    self.next_expected = id;
+                    tracing::debug!(
+                        gap_start = self.next_expected - skipped,
+                        gap_end = id,
+                        "Gap timeout, skipping {} chunks", skipped
+                    );
+                } else {
+                    break;
+                }
+            }
+
+            if slot.is_ready() {
                 if let Some(mut slot) = self.slots.remove(&id) {
                     if let Some(chunk) = slot.chunk.take() {
                         ready.push(chunk);
                         self.chunks_forwarded += 1;
                     }
                 }
-            }
-        } else {
-            // Forward in order with brief wait
-            while let Some((&id, slot)) = self.slots.first_key_value() {
-                // Gap detection: if the first buffered chunk is ahead of next_expected,
-                // earlier chunks are missing. Wait for them to arrive or time out.
-                if id > self.next_expected {
-                    if slot.is_timed_out(timeout) {
-                        // Gap timed out - skip missing chunks
-                        let skipped = id - self.next_expected;
-                        self.chunks_timeout += skipped;
-                        self.next_expected = id;
-                        tracing::debug!(
-                            gap_start = self.next_expected - skipped,
-                            gap_end = id,
-                            "Gap timeout, skipping {} chunks", skipped
-                        );
-                        // Fall through to process this slot
-                    } else {
-                        // Still waiting for earlier chunks
-                        break;
-                    }
-                }
-
-                if slot.is_ready() {
-                    if let Some(mut slot) = self.slots.remove(&id) {
-                        if let Some(chunk) = slot.chunk.take() {
-                            ready.push(chunk);
-                            self.chunks_forwarded += 1;
-                        }
-                    }
-                    self.next_expected = id + 1;
-                } else if slot.is_timed_out(timeout) {
-                    // Timeout - skip this slot
-                    self.slots.remove(&id);
-                    self.chunks_timeout += 1;
-                    self.next_expected = id + 1;
-                    tracing::debug!(chunk_id = id, "Chunk timeout, skipping");
-                } else {
-                    // Not ready yet, and not timed out - stop here
-                    break;
-                }
+                self.next_expected = id + 1;
+            } else if slot.is_timed_out(timeout) {
+                self.slots.remove(&id);
+                self.chunks_timeout += 1;
+                self.next_expected = id + 1;
+                tracing::debug!(chunk_id = id, "Chunk timeout, skipping");
+            } else {
+                break;
             }
         }
 
@@ -247,14 +276,19 @@ impl ChunkReceiver {
         self.buffer.record_announcement(ann);
     }
 
-    /// Handle chunk data
-    pub fn handle_chunk(&mut self, chunk: Chunk) {
-        self.buffer.store_chunk(chunk);
+    /// Handle chunk data with flow mode from wire
+    pub fn handle_chunk(&mut self, chunk: Chunk, flow_mode: FlowMode) {
+        self.buffer.store_chunk(chunk, flow_mode);
     }
 
     /// Drain ready chunks
     pub fn drain(&mut self) -> Vec<Chunk> {
         self.buffer.drain_ready()
+    }
+
+    /// Update reorder timeout dynamically based on RTT spread
+    pub fn set_reorder_timeout_ms(&mut self, timeout_ms: u64) {
+        self.buffer.config.reorder_timeout_ms = timeout_ms;
     }
 
     /// Get stats
@@ -269,32 +303,33 @@ mod tests {
     use chainlightning_common::ChunkId;
 
     #[test]
-    fn test_immediate_forward() {
+    fn test_realtime_immediate_forward() {
         let config = ReceiverConfig {
             reorder_timeout_ms: 100,
             max_buffer_chunks: 1000,
-            immediate_forward: true,
+            immediate_forward: false,
         };
 
         let mut buffer = ReassemblyBuffer::new(config);
+        let rt_mode = FlowMode::Realtime { link_id: 2 };
 
-        // Store chunks out of order
+        // Store Realtime chunks out of order
         let mut chunk3 = Chunk::new(ChunkId(3));
         chunk3.add_packet(&[3, 3, 3]);
 
         let mut chunk1 = Chunk::new(ChunkId(1));
         chunk1.add_packet(&[1, 1, 1]);
 
-        buffer.store_chunk(chunk3);
-        buffer.store_chunk(chunk1);
+        buffer.store_chunk(chunk3, rt_mode);
+        buffer.store_chunk(chunk1, rt_mode);
 
-        // Should drain both immediately (out of order)
+        // Realtime chunks should drain immediately regardless of order
         let ready = buffer.drain_ready();
         assert_eq!(ready.len(), 2);
     }
 
     #[test]
-    fn test_ordered_with_timeout() {
+    fn test_bulk_ordered_with_timeout() {
         let config = ReceiverConfig {
             reorder_timeout_ms: 10,
             max_buffer_chunks: 1000,
@@ -302,13 +337,14 @@ mod tests {
         };
 
         let mut buffer = ReassemblyBuffer::new(config);
+        let bulk_mode = FlowMode::Bulk;
 
-        // Store chunk 1 (skipping 0)
+        // Store chunk 1 (skipping 0) as Bulk
         let mut chunk1 = Chunk::new(ChunkId(1));
         chunk1.add_packet(&[1, 1, 1]);
-        buffer.store_chunk(chunk1);
+        buffer.store_chunk(chunk1, bulk_mode);
 
-        // Should not drain (waiting for 0)
+        // Should not drain (waiting for 0 — Bulk uses ordered delivery)
         let ready = buffer.drain_ready();
         assert_eq!(ready.len(), 0);
 
@@ -316,6 +352,27 @@ mod tests {
         std::thread::sleep(Duration::from_millis(15));
 
         // Now should drain (chunk 0 timed out)
+        let ready = buffer.drain_ready();
+        assert_eq!(ready.len(), 1);
+    }
+
+    #[test]
+    fn test_singlelink_bypasses_reorder() {
+        let config = ReceiverConfig {
+            reorder_timeout_ms: 100,
+            max_buffer_chunks: 1000,
+            immediate_forward: false,
+        };
+
+        let mut buffer = ReassemblyBuffer::new(config);
+        let sl_mode = FlowMode::SingleLink { link_id: 0 };
+
+        // Store SingleLink chunk out of order
+        let mut chunk5 = Chunk::new(ChunkId(5));
+        chunk5.add_packet(&[5, 5, 5]);
+        buffer.store_chunk(chunk5, sl_mode);
+
+        // SingleLink should forward immediately
         let ready = buffer.drain_ready();
         assert_eq!(ready.len(), 1);
     }

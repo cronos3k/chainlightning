@@ -15,8 +15,8 @@ pub const MSG_PROBE: u8 = 0x06;
 /// Maximum chunk payload size (1MB)
 pub const MAX_CHUNK_PAYLOAD: usize = 1_048_576;
 
-/// Chunk header size: type(1) + chunk_id(8) + link_id(1) + total_size(4) + offset(4) + payload_len(2)
-pub const CHUNK_HEADER_SIZE: usize = 20;
+/// Chunk header size: type(1) + chunk_id(8) + link_id(1) + flow_mode(1) + total_size(4) + offset(4) + payload_len(2)
+pub const CHUNK_HEADER_SIZE: usize = 21;
 
 /// Announcement header size: type(1) + chunk_id(8) + link_id(1) + expected_size(4) + timestamp(8)
 pub const ANNOUNCE_HEADER_SIZE: usize = 22;
@@ -115,6 +115,11 @@ impl ChunkId {
     }
 }
 
+/// Flow mode wire values
+pub const FLOW_MODE_REALTIME: u8 = 0;
+pub const FLOW_MODE_SINGLELINK: u8 = 1;
+pub const FLOW_MODE_BULK: u8 = 2;
+
 /// Data chunk packet
 #[derive(Debug, Clone)]
 pub struct ChunkPacket {
@@ -122,6 +127,8 @@ pub struct ChunkPacket {
     pub chunk_id: ChunkId,
     /// Link this chunk is being sent on
     pub link_id: u8,
+    /// Flow routing mode (0=Realtime, 1=SingleLink, 2=Bulk)
+    pub flow_mode: u8,
     /// Total size of the chunk (for multi-fragment chunks)
     pub total_size: u32,
     /// Offset within the chunk (for fragmentation)
@@ -139,6 +146,7 @@ impl ChunkPacket {
         buf.push(MSG_DATA);
         buf.extend_from_slice(&self.chunk_id.0.to_be_bytes());
         buf.push(self.link_id);
+        buf.push(self.flow_mode);
         buf.extend_from_slice(&self.total_size.to_be_bytes());
         buf.extend_from_slice(&self.offset.to_be_bytes());
         buf.extend_from_slice(&payload_len.to_be_bytes());
@@ -158,9 +166,10 @@ impl ChunkPacket {
 
         let chunk_id = ChunkId(u64::from_be_bytes(buf[1..9].try_into().ok()?));
         let link_id = buf[9];
-        let total_size = u32::from_be_bytes(buf[10..14].try_into().ok()?);
-        let offset = u32::from_be_bytes(buf[14..18].try_into().ok()?);
-        let payload_len = u16::from_be_bytes(buf[18..20].try_into().ok()?) as usize;
+        let flow_mode = buf[10];
+        let total_size = u32::from_be_bytes(buf[11..15].try_into().ok()?);
+        let offset = u32::from_be_bytes(buf[15..19].try_into().ok()?);
+        let payload_len = u16::from_be_bytes(buf[19..21].try_into().ok()?) as usize;
 
         if buf.len() < CHUNK_HEADER_SIZE + payload_len {
             return None;
@@ -171,6 +180,7 @@ impl ChunkPacket {
         Some(ChunkPacket {
             chunk_id,
             link_id,
+            flow_mode,
             total_size,
             offset,
             payload,
@@ -372,7 +382,7 @@ impl PathState {
 }
 
 /// Probe packet for Glorytun/MUD-style rate control
-/// Sent every 200ms per link by both sides. 51 bytes on wire.
+/// Sent every 200ms per link by both sides. 56 bytes on wire.
 #[derive(Debug, Clone, Copy)]
 pub struct ProbePacket {
     /// Link this probe is for
@@ -395,10 +405,13 @@ pub struct ProbePacket {
     pub loss_ratio: u8,
     /// Path state
     pub path_state: PathState,
+    /// How long we held the echoed timestamp before sending (microseconds).
+    /// The receiver subtracts this from the raw RTT to remove scheduling delay.
+    pub echo_delay_us: u64,
 }
 
 impl ProbePacket {
-    pub const SIZE: usize = 51;
+    pub const SIZE: usize = 56;
 
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::SIZE);
@@ -413,7 +426,7 @@ impl ProbePacket {
         buf.extend_from_slice(&self.rx_packets.to_be_bytes());      // 4
         buf.push(self.loss_ratio);                                  // 1
         buf.push(self.path_state as u8);                            // 1
-        buf.extend_from_slice(&[0u8; 3]);                           // 3 reserved
+        buf.extend_from_slice(&self.echo_delay_us.to_be_bytes());   // 8
         buf
     }
 
@@ -432,6 +445,7 @@ impl ProbePacket {
             rx_packets: u32::from_be_bytes(buf[42..46].try_into().ok()?),
             loss_ratio: buf[46],
             path_state: PathState::from_u8(buf[47]),
+            echo_delay_us: u64::from_be_bytes(buf[48..56].try_into().ok()?),
         })
     }
 }
@@ -483,16 +497,19 @@ mod tests {
         let chunk = ChunkPacket {
             chunk_id: ChunkId(12345),
             link_id: 2,
+            flow_mode: FLOW_MODE_BULK,
             total_size: 65536,
             offset: 0,
             payload: vec![1, 2, 3, 4, 5],
         };
 
         let encoded = chunk.encode();
+        assert_eq!(encoded.len(), CHUNK_HEADER_SIZE + 5);
         let decoded = ChunkPacket::decode(&encoded).unwrap();
 
         assert_eq!(chunk.chunk_id, decoded.chunk_id);
         assert_eq!(chunk.link_id, decoded.link_id);
+        assert_eq!(chunk.flow_mode, decoded.flow_mode);
         assert_eq!(chunk.total_size, decoded.total_size);
         assert_eq!(chunk.offset, decoded.offset);
         assert_eq!(chunk.payload, decoded.payload);

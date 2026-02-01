@@ -8,6 +8,7 @@
 
 use std::time::{Duration, Instant};
 use chainlightning_common::config::LinkSchedulerConfig;
+use crate::flow_classifier::FlowMode;
 
 /// Link health state
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -144,6 +145,10 @@ pub struct LinkScheduler {
     last_link_change: Instant,
     /// Direction: true = upload (client to server), false = download (server to client)
     is_upload: bool,
+    /// Bulk-eligible link IDs (excluding RTT outliers)
+    bulk_eligible: Vec<usize>,
+    /// Total weight of bulk-eligible links
+    bulk_total_weight: u32,
 }
 
 impl LinkScheduler {
@@ -165,9 +170,9 @@ impl LinkScheduler {
             .max_by_key(|(_, &bw)| bw)
             .map(|(id, _)| id);
 
+        let all_links: Vec<usize> = links.iter().map(|l| l.id).collect();
         Self {
             config,
-            links,
             cursor: 0,
             total_weight,
             measurement_window: Duration::from_secs(2),
@@ -176,6 +181,9 @@ impl LinkScheduler {
             preferred_link: initial_preferred,
             last_link_change: Instant::now(),
             is_upload,
+            bulk_eligible: all_links,
+            bulk_total_weight: total_weight,
+            links,
         }
     }
 
@@ -214,6 +222,9 @@ impl LinkScheduler {
 
         // Check if it's time to adjust weights based on measurements
         self.maybe_adjust_weights();
+
+        // Recalculate bulk-eligible links (RTT outlier exclusion)
+        self.update_bulk_eligible();
     }
 
     /// Adjust weights - use CONFIGURED values, not measured
@@ -241,8 +252,34 @@ impl LinkScheduler {
         self.total_weight = self.links.iter().map(|l| l.weight).sum::<u32>().max(1);
     }
 
-    /// Schedule a chunk
-    pub fn schedule(&mut self, chunk_size: usize, multi_link: bool) -> ScheduleDecision {
+    /// Schedule a chunk based on flow mode
+    pub fn schedule(&mut self, chunk_size: usize, flow_mode: &FlowMode) -> ScheduleDecision {
+        match flow_mode {
+            FlowMode::Realtime { link_id } => {
+                // Force the specific low-latency link, zero delay
+                let lid = *link_id;
+                if let Some(link) = self.links.get_mut(lid) {
+                    link.record_sent(chunk_size as u64);
+                }
+                ScheduleDecision {
+                    link_id: lid,
+                    delay: Duration::ZERO,
+                    participating_links: vec![lid],
+                }
+            }
+            FlowMode::SingleLink { link_id: _ } => {
+                // Weighted round-robin across all links (existing behavior)
+                self.schedule_single_link(chunk_size)
+            }
+            FlowMode::Bulk => {
+                // Multi-link with sync delay
+                self.schedule_multi_link(chunk_size)
+            }
+        }
+    }
+
+    /// Legacy schedule method for backward compatibility (tests, etc.)
+    pub fn schedule_bool(&mut self, chunk_size: usize, multi_link: bool) -> ScheduleDecision {
         if multi_link {
             self.schedule_multi_link(chunk_size)
         } else {
@@ -397,9 +434,14 @@ impl LinkScheduler {
         }
     }
 
-    /// Multi-link scheduling - weighted round robin
+    /// Multi-link scheduling - weighted round robin among bulk-eligible links
+    /// Links with RTT > 2.5x median are excluded to prevent reorder buffer overflow
     fn schedule_multi_link(&mut self, chunk_size: usize) -> ScheduleDecision {
-        let link_id = self.weighted_select();
+        let link_id = if self.bulk_eligible.len() >= 2 {
+            self.weighted_select_bulk()
+        } else {
+            self.weighted_select()
+        };
 
         let delay = if self.config.enable_sync {
             self.calculate_sync_delay(link_id)
@@ -411,17 +453,108 @@ impl LinkScheduler {
             link.record_sent(chunk_size as u64);
         }
 
-        let participating: Vec<usize> = self.links
-            .iter()
-            .filter(|l| l.weight > 0)
-            .map(|l| l.id)
-            .collect();
-
         ScheduleDecision {
             link_id,
             delay,
-            participating_links: participating,
+            participating_links: self.bulk_eligible.clone(),
         }
+    }
+
+    /// Recalculate which links are eligible for bulk (multi-link) scheduling.
+    /// Excludes links whose RTT is more than 2.5x the median RTT of all links,
+    /// since they'd cause excessive reorder buffer delays.
+    fn update_bulk_eligible(&mut self) {
+        let mut link_rtts: Vec<(usize, u64)> = self.links.iter()
+            .filter(|l| l.weight > 0 && l.rtt_us > 0)
+            .map(|l| (l.id, l.rtt_us))
+            .collect();
+
+        if link_rtts.len() <= 1 {
+            // Not enough RTT data — use all links with weight > 0
+            self.bulk_eligible = self.links.iter()
+                .filter(|l| l.weight > 0)
+                .map(|l| l.id)
+                .collect();
+        } else {
+            link_rtts.sort_by_key(|(_, rtt)| *rtt);
+            let median_rtt = link_rtts[link_rtts.len() / 2].1;
+            let threshold = (median_rtt as f64 * 2.5) as u64;
+
+            let eligible: Vec<usize> = link_rtts.iter()
+                .filter(|(_, rtt)| *rtt <= threshold)
+                .map(|(id, _)| *id)
+                .collect();
+
+            // Log when a link is excluded
+            let excluded: Vec<(usize, u64)> = link_rtts.iter()
+                .filter(|(_, rtt)| *rtt > threshold)
+                .copied()
+                .collect();
+            if !excluded.is_empty() {
+                for (id, rtt) in &excluded {
+                    tracing::info!(
+                        "L{} excluded from Bulk: RTT {}ms > threshold {}ms (median {}ms * 2.5)",
+                        id, rtt / 1000, threshold / 1000, median_rtt / 1000
+                    );
+                }
+            }
+
+            self.bulk_eligible = if eligible.is_empty() {
+                // Don't exclude ALL links — keep at least the ones with data
+                link_rtts.iter().map(|(id, _)| *id).collect()
+            } else {
+                eligible
+            };
+        }
+
+        self.bulk_total_weight = self.bulk_eligible.iter()
+            .filter_map(|&id| self.links.get(id))
+            .map(|l| l.weight)
+            .sum::<u32>()
+            .max(1);
+    }
+
+    /// Weighted round-robin selection among bulk-eligible links only
+    fn weighted_select_bulk(&mut self) -> usize {
+        self.cursor = self.cursor.wrapping_add(1);
+        let pos = (self.cursor % self.bulk_total_weight as u64) as u32;
+        let mut cumulative = 0u32;
+
+        for &id in &self.bulk_eligible {
+            if let Some(link) = self.links.get(id) {
+                if link.weight == 0 { continue; }
+                cumulative += link.weight;
+                if pos < cumulative {
+                    return id;
+                }
+            }
+        }
+
+        self.bulk_eligible.first().copied().unwrap_or(0)
+    }
+
+    /// Get the one-way RTT spread in milliseconds among bulk-eligible links.
+    /// Used by the receiver to set its reorder timeout.
+    pub fn bulk_rtt_spread_ms(&self) -> u64 {
+        if self.bulk_eligible.len() < 2 {
+            return 0;
+        }
+
+        let rtts: Vec<u64> = self.bulk_eligible.iter()
+            .filter_map(|&id| self.links.get(id))
+            .filter(|l| l.rtt_us > 0)
+            .map(|l| l.rtt_us)
+            .collect();
+
+        if rtts.len() < 2 {
+            return 0;
+        }
+
+        let min = rtts.iter().copied().min().unwrap_or(0);
+        let max = rtts.iter().copied().max().unwrap_or(0);
+
+        // One-way spread (RTT/2 difference)
+        (max - min) / 2000
     }
 
     /// Weighted round-robin selection
@@ -493,6 +626,7 @@ impl LinkScheduler {
             }
         }
         self.recalculate_total_weight();
+        self.update_bulk_eligible();
     }
 
     /// Force reset to configured values

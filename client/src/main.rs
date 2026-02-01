@@ -7,17 +7,18 @@
 //! This binary only works on Linux due to TUN device requirements.
 
 use std::net::UdpSocket;
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{info, warn, error, debug};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing::{info, warn, debug};
+use tracing_subscriber::EnvFilter;
 
 use chainlightning_common::{
-    Config, ConfigManager, MetricsCollector,
+    ConfigManager, MetricsCollector,
     NUM_LINKS, LINKS, SERVER_PUBLIC_IP, TUN_NAME, TUN_SERVER_IP, TUN_CLIENT_IP, TUN_MTU,
-    protocol::{Packet, ChunkPacket, AnnouncePacket, AckPacket, KeepalivePacket, ProbePacket, now_micros},
+    protocol::{Packet, ChunkPacket, AckPacket, KeepalivePacket, now_micros},
 };
 use chainlightning_core::{
     FlowClassifier, FlowMode,
@@ -73,6 +74,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let socket = UdpSocket::bind(&bind_addr)?;
         socket.set_nonblocking(true)?;
 
+        // Set large socket buffers for high-throughput bonding
+        #[cfg(target_os = "linux")]
+        {
+            let buf_size: libc::c_int = 10 * 1024 * 1024; // 10 MB
+            unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
         // Bind to specific interface to ensure packets go out the right WAN
         #[cfg(target_os = "linux")]
         {
@@ -112,7 +135,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     let flow_classifier = Arc::new(Mutex::new(
-        FlowClassifier::new(config.flow_classifier.clone(), link_bandwidths.clone())
+        FlowClassifier::new(
+            config.flow_classifier.clone(),
+            config.realtime.clone(),
+            config.link_scheduler.link_tiers.clone(),
+            link_bandwidths.clone(),
+        )
     ));
 
     let chunk_aggregator = Arc::new(Mutex::new(
@@ -160,15 +188,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Client ready - connecting to server...");
 
     // Channels for inter-task communication
-    let (tx_to_links, mut rx_to_links) = mpsc::channel::<Chunk>(1000);
-    let (tx_from_links, mut rx_from_links) = mpsc::channel::<Chunk>(1000);
+    // Chunks now carry their FlowMode internally
+    let (tx_to_links, mut rx_to_links) = mpsc::channel::<Chunk>(2000);
+    let (tx_from_links, mut rx_from_links) = mpsc::channel::<(Chunk, FlowMode)>(2000);
 
     // Spawn TUN reader task (Linux only)
     #[cfg(target_os = "linux")]
     {
         let tun_read_flow_classifier = flow_classifier.clone();
         let tun_read_aggregator = chunk_aggregator.clone();
-        let _tun_read_scheduler = link_scheduler.clone();
         let tun_read_metrics = metrics_collector.clone();
         let tun_fd = tun.raw_fd();
         let tx_to_links = tx_to_links.clone();
@@ -184,16 +212,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if n > 0 {
                     let packet = &buf[..n as usize];
 
-                    // Classify flow
-                    let _mode = tun_read_flow_classifier.lock().unwrap().classify(packet);
+                    // Classify flow — now used for routing decisions
+                    let mode = tun_read_flow_classifier.lock().unwrap().classify(packet);
 
                     // Get flow ID
                     let flow_id = chainlightning_common::protocol::FlowId::from_packet(packet);
 
-                    // Aggregate into chunk
-                    let chunk = tun_read_aggregator.lock().unwrap().add_packet(packet, flow_id);
+                    // Aggregate into chunk (mode-aware: Realtime flushes immediately)
+                    let chunk = tun_read_aggregator.lock().unwrap().add_packet(packet, flow_id, mode);
                     if let Some(chunk) = chunk {
-                        // Send chunk to link tasks
                         let _ = tx_to_links.send(chunk).await;
                     }
 
@@ -210,13 +237,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn TUN writer task (Linux only)
     #[cfg(target_os = "linux")]
     {
-        let _tun_write_receiver = chunk_receiver.clone();
         let tun_write_metrics = metrics_collector.clone();
         let tun_fd = tun.raw_fd();
 
         tokio::spawn(async move {
             let mut rx = rx_from_links;
-            while let Some(chunk) = rx.recv().await {
+            while let Some((chunk, _flow_mode)) = rx.recv().await {
                 // Extract packets from chunk and write to TUN
                 for packet in chunk.extract_packets() {
                     unsafe {
@@ -235,7 +261,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let stats = stats_collector.clone();
         let metrics = metrics_collector.clone();
         let rc = rate_controller.clone();
-        let tx = tx_from_links.clone();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 65536];
@@ -246,18 +271,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(packet) = Packet::decode(&buf[..n]) {
                             match packet {
                                 Packet::Data(chunk_pkt) => {
-                                    // Record stats
-                                    stats.lock().unwrap().record_rx(link_id, n);
-                                    metrics.record_chunk_rx(chunk_pkt.payload.len());
-                                    rc.lock().unwrap().record_rx(link_id, n);
-
-                                    // Convert to Chunk and send to receiver
-                                    let mut chunk = Chunk::new(chunk_pkt.chunk_id);
-                                    chunk.data = chunk_pkt.payload;
-
-                                    let _ = tx.send(chunk).await;
-
-                                    // Send ACK back (socket is connected, use send())
+                                    // ACK FIRST — before any locks or processing.
+                                    // Delayed ACKs cause rate controller false-loss → death spiral.
                                     let ack = AckPacket {
                                         chunk_id: chunk_pkt.chunk_id,
                                         link_id: link_id as u8,
@@ -265,6 +280,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         recv_timestamp_us: now_micros(),
                                     };
                                     let _ = socket.send(&ack.encode());
+
+                                    // Record stats
+                                    stats.lock().unwrap().record_rx(link_id, n);
+                                    metrics.record_chunk_rx(chunk_pkt.payload.len());
+                                    rc.lock().unwrap().record_rx(link_id, n);
+
+                                    // Decode flow mode from wire
+                                    let flow_mode = FlowMode::from_wire(chunk_pkt.flow_mode, link_id);
+
+                                    // Convert to Chunk and store in receiver
+                                    let mut chunk = Chunk::new(chunk_pkt.chunk_id);
+                                    chunk.data = chunk_pkt.payload;
+                                    chunk.flow_mode = flow_mode;
+
+                                    // Store only — drain happens in dedicated task
+                                    receiver.lock().unwrap().handle_chunk(chunk, flow_mode);
                                 }
                                 Packet::Announce(ann) => {
                                     receiver.lock().unwrap().handle_announcement(ann);
@@ -296,6 +327,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Spawn receiver drain task — decoupled from link receivers to prevent ACK delays.
+    // Link receivers now only store chunks; this task drains them to the TUN writer.
+    {
+        let drain_receiver = chunk_receiver.clone();
+        let drain_tx = tx_from_links.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(1));
+            loop {
+                interval.tick().await;
+                let ready = drain_receiver.lock().unwrap().drain();
+                for chunk in ready {
+                    let mode = chunk.flow_mode;
+                    let _ = drain_tx.send((chunk, mode)).await;
+                }
+            }
+        });
+    }
+
     // Spawn chunk sender task
     let sockets_clone: Vec<_> = sockets.iter().map(|s| s.try_clone().unwrap()).collect();
     let sender_scheduler = link_scheduler.clone();
@@ -306,14 +356,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         let mut rx = rx_to_links;
         while let Some(chunk) = rx.recv().await {
-            // Schedule chunk - use single-link mode: pick fastest link by measured bandwidth
-            // This avoids TCP reordering issues when distributing across heterogeneous links
-            let decision = sender_scheduler.lock().unwrap().schedule(chunk.size(), false);
+            // Schedule chunk based on flow mode
+            let flow_mode = chunk.flow_mode;
+            let decision = sender_scheduler.lock().unwrap().schedule(chunk.size(), &flow_mode);
 
-            // Encode chunk
+            // Apply sync delay for Bulk mode
+            if decision.delay > Duration::ZERO {
+                tokio::time::sleep(decision.delay).await;
+            }
+
+            // Encode chunk with flow_mode on wire
             let chunk_pkt = ChunkPacket {
                 chunk_id: chunk.id,
                 link_id: decision.link_id as u8,
+                flow_mode: flow_mode.to_wire(),
                 total_size: chunk.size() as u32,
                 offset: 0,
                 payload: chunk.data.clone(),
@@ -338,7 +394,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metrics_updater = metrics_collector.clone();
     let scheduler_updater = link_scheduler.clone();
     let aggregator_updater = chunk_aggregator.clone();
+    let classifier_updater = flow_classifier.clone();
     let rc_updater = rate_controller.clone();
+    let receiver_updater = chunk_receiver.clone();
     let rc_enabled = config.rate_control.enabled;
 
     tokio::spawn(async move {
@@ -359,11 +417,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             info!("{}", stats.summary());
 
-            // Update scheduler with new bandwidths (adaptive algorithm)
+            // Use rate controller RTTs (from probes) — stats collector RTTs may be zeros
+            let rc_rtts: Vec<u64> = if rc_enabled {
+                let rc = rc_updater.lock().unwrap();
+                (0..bandwidths.len()).map(|i| rc.rtt_us(i)).collect()
+            } else {
+                rtts.clone()
+            };
+
+            // Update scheduler with bandwidths and rate-controller RTTs
             drop(stats);
-            for (i, (&bw, &rtt)) in bandwidths.iter().zip(rtts.iter()).enumerate() {
+            for (i, &bw) in bandwidths.iter().enumerate() {
+                let rtt = rc_rtts.get(i).copied().unwrap_or(0);
                 scheduler_updater.lock().unwrap().update_link(i, bw, rtt, true);
                 aggregator_updater.lock().unwrap().update_link_stats(i, bw, (rtt / 1000) as u32);
+            }
+
+            // Update flow classifier with current bandwidths and RTTs
+            {
+                let mut fc = classifier_updater.lock().unwrap();
+                fc.update_bandwidths(bandwidths.clone());
+                fc.update_rtts(rc_rtts.clone());
+
+                // Log flow classification stats
+                let fc_stats = fc.stats();
+                if fc_stats.total_flows > 0 {
+                    info!("Flows: {} total (RT={}, SL={}, Bulk={}) rt_link=L{} fast_link=L{}",
+                        fc_stats.total_flows, fc_stats.realtime_flows,
+                        fc_stats.single_link_flows, fc_stats.bulk_flows,
+                        fc_stats.realtime_link, fc_stats.fastest_link);
+                }
+
+                // Expire old flows periodically
+                fc.expire_flows();
             }
 
             // Rate control: check timeouts and push weights
@@ -373,6 +459,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let weights = rc.weights();
                 drop(rc);
                 scheduler_updater.lock().unwrap().set_rate_controlled_weights(&weights);
+            }
+
+            // Dynamic reorder timeout: 1.5x the one-way RTT spread of bulk-eligible links
+            {
+                let spread_ms = scheduler_updater.lock().unwrap().bulk_rtt_spread_ms();
+                if spread_ms > 0 {
+                    let timeout_ms = (spread_ms * 3 / 2).max(5).min(200);
+                    receiver_updater.lock().unwrap().set_reorder_timeout_ms(timeout_ms);
+                }
             }
 
             // Log status every 5 seconds

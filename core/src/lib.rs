@@ -10,7 +10,7 @@ pub mod receiver;
 pub mod tun;
 pub mod stats;
 
-pub use flow_classifier::{FlowClassifier, FlowState, FlowMode};
+pub use flow_classifier::{FlowClassifier, FlowState, FlowMode, FlowClassifierStats};
 pub use chunk_aggregator::{ChunkAggregator, Chunk};
 pub use link_scheduler::{LinkScheduler, ScheduleDecision, LinkHealth};
 pub use rate_controller::RateController;

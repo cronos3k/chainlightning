@@ -3,7 +3,7 @@
 //! Exercises the full rate control + scheduling pipeline:
 //! - RateController (Glorytun/MUD-style) with simulated probe exchange
 //! - LinkScheduler with dynamic weight updates via set_rate_controlled_weights()
-//! - ProbePacket encode/decode wire format (51-byte roundtrip)
+//! - ProbePacket encode/decode wire format (56-byte roundtrip)
 //! - Congestion detection, loss tracking, PathState machine transitions
 //! - Link failure (timeout → DOWN) and recovery (PROBING → RUNNING)
 //! - Rate floor protection (death spiral prevention)
@@ -133,6 +133,7 @@ fn simulate_cycle(
             rx_packets: recv_pkts,
             loss_ratio: 0,
             path_state: PathState::Running,
+            echo_delay_us: 0,
         };
 
         rc.process_probe(&client_probe);
@@ -395,7 +396,7 @@ fn test_loss_detection() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// TEST 5: ProbePacket Wire Format (51 bytes)
+// TEST 5: ProbePacket Wire Format (56 bytes)
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -411,13 +412,14 @@ fn test_probe_packet_wire_format() {
         rx_packets: 1116,
         loss_ratio: 7,
         path_state: PathState::Lossy,
+        echo_delay_us: 150_000,
     };
 
     let encoded = probe.encode();
     println!("=== TEST 5: Probe Wire Format ===");
     println!("Size: {} bytes (expected {})", encoded.len(), ProbePacket::SIZE);
 
-    assert_eq!(encoded.len(), 51, "Probe must be 51 bytes");
+    assert_eq!(encoded.len(), 56, "Probe must be 56 bytes");
     assert_eq!(encoded[0], 0x06, "First byte must be MSG_PROBE (0x06)");
 
     let d = ProbePacket::decode(&encoded).expect("decode should succeed");
@@ -431,6 +433,7 @@ fn test_probe_packet_wire_format() {
     assert_eq!(d.rx_packets, 1116);
     assert_eq!(d.loss_ratio, 7);
     assert_eq!(d.path_state, PathState::Lossy);
+    assert_eq!(d.echo_delay_us, 150_000);
 
     // All PathState variants roundtrip
     for &state in &[PathState::Running, PathState::Lossy, PathState::Down, PathState::Probing] {
@@ -474,7 +477,7 @@ fn test_scheduler_weight_integration() {
     // Schedule 10k chunks and measure distribution
     let mut counts = [0u32; NUM_LINKS];
     for _ in 0..10_000 {
-        let d = sched.schedule(1400, false);
+        let d = sched.schedule_bool(1400, false);
         counts[d.link_id] += 1;
     }
 
@@ -751,6 +754,7 @@ fn test_dual_rate_controller_probe_exchange() {
                 rx_packets: 100,
                 loss_ratio: 0,
                 path_state: PathState::Running,
+                echo_delay_us: 0,
             };
             server_rc.process_probe(&client_probe);
 
@@ -766,6 +770,7 @@ fn test_dual_rate_controller_probe_exchange() {
                 rx_packets: 100,
                 loss_ratio: 0,
                 path_state: PathState::Running,
+                echo_delay_us: 0,
             };
             client_rc.process_probe(&server_probe);
         }
