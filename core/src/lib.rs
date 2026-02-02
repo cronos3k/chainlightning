@@ -15,4 +15,4 @@ pub use chunk_aggregator::{ChunkAggregator, Chunk};
 pub use link_scheduler::{LinkScheduler, ScheduleDecision, LinkHealth};
 pub use rate_controller::RateController;
 pub use receiver::{ChunkReceiver, ReassemblyBuffer};
-pub use stats::{LinkStats, StatsCollector};
+pub use stats::{LinkStats, StatsCollector, AtomicCounters};

@@ -4,8 +4,60 @@
 //! and health monitoring.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tracing::warn;
 use chainlightning_common::NUM_LINKS;
+
+/// Lock-free counters for the hot path (per-link senders/receivers)
+pub struct AtomicCounters {
+    tx_bytes: Vec<AtomicU64>,
+    tx_packets: Vec<AtomicU64>,
+    rx_bytes: Vec<AtomicU64>,
+    rx_packets: Vec<AtomicU64>,
+}
+
+impl AtomicCounters {
+    pub fn new(num_links: usize) -> Self {
+        Self {
+            tx_bytes: (0..num_links).map(|_| AtomicU64::new(0)).collect(),
+            tx_packets: (0..num_links).map(|_| AtomicU64::new(0)).collect(),
+            rx_bytes: (0..num_links).map(|_| AtomicU64::new(0)).collect(),
+            rx_packets: (0..num_links).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// Record TX (called from per-link sender, no lock needed)
+    pub fn record_tx(&self, link_id: usize, bytes: usize) {
+        if link_id < self.tx_bytes.len() {
+            self.tx_bytes[link_id].fetch_add(bytes as u64, Ordering::Relaxed);
+            self.tx_packets[link_id].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record RX (called from per-link receiver, no lock needed)
+    pub fn record_rx(&self, link_id: usize, bytes: usize) {
+        if link_id < self.rx_bytes.len() {
+            self.rx_bytes[link_id].fetch_add(bytes as u64, Ordering::Relaxed);
+            self.rx_packets[link_id].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Drain accumulated TX counters for a link (called from 1/sec tick)
+    pub fn drain_tx(&self, link_id: usize) -> (u64, u64) {
+        let bytes = self.tx_bytes[link_id].swap(0, Ordering::Relaxed);
+        let packets = self.tx_packets[link_id].swap(0, Ordering::Relaxed);
+        (bytes, packets)
+    }
+
+    /// Drain accumulated RX counters for a link (called from 1/sec tick)
+    pub fn drain_rx(&self, link_id: usize) -> (u64, u64) {
+        let bytes = self.rx_bytes[link_id].swap(0, Ordering::Relaxed);
+        let packets = self.rx_packets[link_id].swap(0, Ordering::Relaxed);
+        (bytes, packets)
+    }
+}
 
 /// Per-link statistics
 #[derive(Debug, Clone)]
@@ -146,6 +198,8 @@ pub struct StatsCollector {
     bandwidth_window: Duration,
     /// Health check timeout
     health_timeout: Duration,
+    /// Lock-free counters shared with hot path tasks
+    pub atomic: Arc<AtomicCounters>,
 }
 
 impl StatsCollector {
@@ -155,7 +209,13 @@ impl StatsCollector {
             ewma_alpha,
             bandwidth_window: Duration::from_millis(bandwidth_window_ms),
             health_timeout: Duration::from_secs(5),
+            atomic: Arc::new(AtomicCounters::new(num_links)),
         }
+    }
+
+    /// Get shared atomic counters for hot path tasks
+    pub fn atomic_counters(&self) -> Arc<AtomicCounters> {
+        self.atomic.clone()
     }
 
     /// Record TX on a link
@@ -186,12 +246,43 @@ impl StatsCollector {
         }
     }
 
-    /// Periodic update (call every second or so)
-    pub fn tick(&mut self) {
+    /// Periodic update (call every second or so).
+    /// Folds atomic counters from hot path into per-link stats.
+    /// Returns per-link deltas (tx_bytes, rx_bytes) for the caller to fold into rate controller.
+    pub fn tick(&mut self) -> Vec<(u64, u64)> {
+        let mut deltas = Vec::with_capacity(self.links.len());
+
+        // Drain atomic counters (accumulated by per-link sender/receiver tasks)
+        for (i, stats) in self.links.iter_mut().enumerate() {
+            let (tx_bytes, tx_packets) = self.atomic.drain_tx(i);
+            let (rx_bytes, rx_packets) = self.atomic.drain_rx(i);
+
+            if tx_bytes > 0 || rx_bytes > 0 {
+                warn!("DRAIN L{}: tx={}B/{}pkt rx={}B/{}pkt accum_tx={} bw_bps={}",
+                    i, tx_bytes, tx_packets, rx_bytes, rx_packets,
+                    stats.tx_bytes + tx_bytes, stats.bandwidth_bps);
+                stats.last_activity = Instant::now();
+            }
+            stats.tx_bytes += tx_bytes;
+            stats.tx_packets += tx_packets;
+            stats.pending_bytes += tx_bytes;
+            stats.rx_bytes += rx_bytes;
+            stats.rx_packets += rx_packets;
+
+            deltas.push((tx_bytes, rx_bytes));
+        }
+
         for stats in &mut self.links {
+            let pre_bw = stats.bandwidth_bps;
             stats.update_bandwidth(self.bandwidth_window);
+            if pre_bw != stats.bandwidth_bps {
+                warn!("BW_UPDATE L{}: {}bps -> {}bps (window={:?})",
+                    stats.id, pre_bw, stats.bandwidth_bps, self.bandwidth_window);
+            }
             stats.update_health(self.health_timeout);
         }
+
+        deltas
     }
 
     /// Get bandwidths for all links (bytes/sec)

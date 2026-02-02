@@ -243,6 +243,15 @@ impl FlowClassifier {
 
     /// Update link bandwidths (from stats collector)
     pub fn update_bandwidths(&mut self, bandwidths: Vec<u64>) {
+        // Don't overwrite with all-zero values — keep configured/last-known bandwidths.
+        // This prevents cold-start issues where measured bandwidths haven't been
+        // computed yet (first stats window), which would cause weighted_flow_link()
+        // to assign all flows to link 0.
+        let new_total: u64 = bandwidths.iter().sum();
+        if new_total == 0 {
+            return;
+        }
+
         self.link_bandwidths = bandwidths;
         self.fastest_link = self.link_bandwidths.iter()
             .enumerate()
@@ -256,6 +265,32 @@ impl FlowClassifier {
     pub fn update_rtts(&mut self, rtts: Vec<u64>) {
         self.link_rtts = rtts;
         self.realtime_link = self.find_lowest_latency_eligible();
+    }
+
+    /// Assign a link to a flow using weighted hashing based on link bandwidths.
+    /// Flows are distributed proportionally: a 220 Mbps Starlink link gets ~3.7x
+    /// more flows than a 60 Mbps ADSL link.
+    fn weighted_flow_link(&self, flow_id: FlowId) -> usize {
+        if self.link_bandwidths.is_empty() {
+            return 0;
+        }
+
+        let total: u64 = self.link_bandwidths.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+
+        // Use the flow_id's inner u64 directly — it's already a hash of the 5-tuple
+        let bucket = flow_id.0 % total;
+        let mut cumulative = 0u64;
+        for (i, &bw) in self.link_bandwidths.iter().enumerate() {
+            cumulative += bw;
+            if bucket < cumulative {
+                return i;
+            }
+        }
+
+        self.link_bandwidths.len() - 1
     }
 
     /// Extract protocol and ports from an IP packet
@@ -329,9 +364,10 @@ impl FlowClassifier {
         let multi_threshold = self.config.multi_link_threshold;
         let monitor_dur = Duration::from_millis(self.config.monitor_duration_ms);
 
-        // Get or create flow state
+        // Get or create flow state — assign to weighted link (not always fastest)
+        let assigned_link = self.weighted_flow_link(flow_id);
         let flow = self.flows.entry(flow_id).or_insert_with(|| {
-            FlowState::new(flow_id, fastest_link)
+            FlowState::new(flow_id, assigned_link)
         });
 
         // Cache protocol info on first packet
@@ -426,11 +462,12 @@ impl FlowClassifier {
                         .unwrap_or(Duration::ZERO);
 
                     if below_duration >= monitor_dur {
-                        flow.mode = FlowMode::SingleLink { link_id: fastest_link };
+                        flow.mode = FlowMode::SingleLink { link_id: assigned_link };
                         flow.exceeded_threshold_at = None;
                         tracing::debug!(
                             flow_id = ?flow_id,
                             ratio = ratio,
+                            link_id = assigned_link,
                             "Flow switched to SingleLink"
                         );
                     }
@@ -597,7 +634,8 @@ mod tests {
         packet[22..24].copy_from_slice(&[0x00, 0x50]); // dst port 80
 
         let mode = classifier.classify(&packet);
-        assert!(matches!(mode, FlowMode::SingleLink { link_id: 3 }));
+        // Weighted hash distributes flows across links proportionally to bandwidth
+        assert!(matches!(mode, FlowMode::SingleLink { .. }));
     }
 
     #[test]

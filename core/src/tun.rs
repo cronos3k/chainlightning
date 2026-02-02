@@ -224,6 +224,15 @@ pub fn configure_tun(name: &str, local_ip: &str, peer_ip: &str, mtu: u32) -> IoR
         return Err(IoError::new(ErrorKind::Other, "Failed to bring up interface"));
     }
 
+    // ip link set dev {name} txqueuelen 5000 — prevent kernel packet drops under load
+    let status = Command::new("ip")
+        .args(["link", "set", "dev", name, "txqueuelen", "5000"])
+        .status()?;
+
+    if !status.success() {
+        tracing::warn!("Failed to set txqueuelen on {}", name);
+    }
+
     Ok(())
 }
 

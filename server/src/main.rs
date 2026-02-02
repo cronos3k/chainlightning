@@ -148,6 +148,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         StatsCollector::new(NUM_LINKS, config.stats.ewma_alpha, config.stats.bandwidth_window_ms)
     ));
 
+    // Lock-free atomic counters for send/receive hot path (avoids stats/rc mutex contention)
+    let atomic_counters = stats_collector.lock().unwrap().atomic_counters();
+
     let metrics_collector = Arc::new(MetricsCollector::new());
 
     // Initialize rate controller with download bandwidths
@@ -170,18 +173,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("All components initialized");
     info!("Server ready - waiting for client connections...");
 
-    // Channels for inter-task communication
-    let (tx_to_links, mut rx_to_links) = mpsc::channel::<Chunk>(2000);
-    let (tx_from_links, mut rx_from_links) = mpsc::channel::<(Chunk, FlowMode)>(2000);
+    // Per-link sender channels — each link gets its own send queue for parallel sending
+    let mut link_txs: Vec<mpsc::Sender<Chunk>> = Vec::new();
+    let mut link_rxs: Vec<Option<mpsc::Receiver<Chunk>>> = Vec::new();
+    for _ in 0..NUM_LINKS {
+        let (tx, rx) = mpsc::channel::<Chunk>(4000);
+        link_txs.push(tx);
+        link_rxs.push(Some(rx));
+    }
+    // Channel for reassembled chunks going to TUN writer (large buffer absorbs bursts)
+    let (tx_from_links, mut rx_from_links) = mpsc::channel::<(Chunk, FlowMode)>(8000);
 
     // Spawn TUN reader task (Linux only)
     #[cfg(target_os = "linux")]
     {
         let tun_read_flow_classifier = flow_classifier.clone();
         let tun_read_aggregator = chunk_aggregator.clone();
+        let tun_read_scheduler = link_scheduler.clone();
         let tun_read_metrics = metrics_collector.clone();
         let tun_fd = tun.raw_fd();
-        let tx_to_links = tx_to_links.clone();
+        let tun_link_txs = link_txs.clone();
 
         tokio::spawn(async move {
             let mut buf = [0u8; 2000];
@@ -203,7 +214,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Aggregate into chunk (mode-aware: Realtime flushes immediately)
                     let chunk = tun_read_aggregator.lock().unwrap().add_packet(packet, flow_id, mode);
                     if let Some(chunk) = chunk {
-                        let _ = tx_to_links.send(chunk).await;
+                        // Schedule here (1 lock) and route to per-link channel
+                        let decision = tun_read_scheduler.lock().unwrap().schedule(chunk.size(), &chunk.flow_mode);
+                        let _ = tun_link_txs[decision.link_id].send(chunk).await;
                     }
 
                     // Record metrics
@@ -240,8 +253,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (link_id, socket) in sockets.iter().enumerate() {
         let socket = socket.try_clone()?;
         let receiver = chunk_receiver.clone();
-        let stats = stats_collector.clone();
+        let counters = atomic_counters.clone();
         let metrics = metrics_collector.clone();
+        let stats = stats_collector.clone();
         let rc = rate_controller.clone();
         let addrs = client_addrs.clone();
 
@@ -273,10 +287,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     };
                                     let _ = socket.send_to(&ack.encode(), client_addr);
 
-                                    // Record stats
-                                    stats.lock().unwrap().record_rx(link_id, n);
+                                    // Record stats (atomic — no mutex)
+                                    counters.record_rx(link_id, n);
                                     metrics.record_chunk_rx(chunk_pkt.payload.len());
-                                    rc.lock().unwrap().record_rx(link_id, n);
 
                                     // Decode flow mode from wire
                                     let flow_mode = FlowMode::from_wire(chunk_pkt.flow_mode, link_id);
@@ -326,7 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let drain_tx = tx_from_links.clone();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(1));
+            let mut interval = tokio::time::interval(Duration::from_micros(100));
             loop {
                 interval.tick().await;
                 let ready = drain_receiver.lock().unwrap().drain();
@@ -338,59 +351,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Spawn chunk sender task
-    let sockets_clone: Vec<_> = sockets.iter().map(|s| s.try_clone().unwrap()).collect();
-    let sender_scheduler = link_scheduler.clone();
-    let sender_stats = stats_collector.clone();
-    let sender_metrics = metrics_collector.clone();
-    let sender_addrs = client_addrs.clone();
-    let sender_rc = rate_controller.clone();
+    // Spawn per-link sender tasks — one sender per link for parallel sending
+    // Scheduling already happened in TUN reader; each sender just encodes and sends
+    // Uses atomic counters instead of stats/rc mutex locks on hot path
+    for link_id in 0..NUM_LINKS {
+        let socket = sockets[link_id].try_clone()?;
+        let mut rx = link_rxs[link_id].take().expect("link_rx already taken");
+        let counters = atomic_counters.clone();
+        let metrics = metrics_collector.clone();
+        let addrs = client_addrs.clone();
 
-    tokio::spawn(async move {
-        let mut rx = rx_to_links;
-        while let Some(chunk) = rx.recv().await {
-            // Schedule chunk based on flow mode
-            let flow_mode = chunk.flow_mode;
-            let decision = sender_scheduler.lock().unwrap().schedule(chunk.size(), &flow_mode);
+        tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                // Encode chunk — move data instead of clone
+                let chunk_size = chunk.size();
+                let flow_wire = chunk.flow_mode.to_wire();
+                let chunk_pkt = ChunkPacket {
+                    chunk_id: chunk.id,
+                    link_id: link_id as u8,
+                    flow_mode: flow_wire,
+                    total_size: chunk_size as u32,
+                    offset: 0,
+                    payload: chunk.data,
+                };
+                let encoded = chunk_pkt.encode();
 
-            // Apply sync delay for Bulk mode
-            if decision.delay > Duration::ZERO {
-                tokio::time::sleep(decision.delay).await;
-            }
-
-            // Encode chunk with flow_mode on wire
-            let chunk_pkt = ChunkPacket {
-                chunk_id: chunk.id,
-                link_id: decision.link_id as u8,
-                flow_mode: flow_mode.to_wire(),
-                total_size: chunk.size() as u32,
-                offset: 0,
-                payload: chunk.data.clone(),
-            };
-            let encoded = chunk_pkt.encode();
-
-            // Send on selected link - use learned client address
-            if let Some(socket) = sockets_clone.get(decision.link_id) {
-                let client_addr = sender_addrs.read().unwrap().addrs[decision.link_id];
+                // Send using learned client address
+                let client_addr = addrs.read().unwrap().addrs[link_id];
                 if let Some(addr) = client_addr {
                     if let Err(e) = socket.send_to(&encoded, addr) {
-                        warn!("Link {} send error: {}", decision.link_id, e);
+                        warn!("Link {} send error: {}", link_id, e);
                     } else {
-                        sender_stats.lock().unwrap().record_tx(decision.link_id, encoded.len());
-                        sender_metrics.record_chunk_tx(chunk.size());
-                        sender_rc.lock().unwrap().record_tx(decision.link_id, encoded.len());
+                        // Atomic — no mutex, no contention
+                        counters.record_tx(link_id, encoded.len());
+                        metrics.record_chunk_tx(chunk_size);
                     }
-                } else {
-                    // No client address learned yet, skip this link
-                    debug!("Link {} has no client address yet, skipping", decision.link_id);
                 }
             }
-        }
-    });
+        });
+    }
 
     // Spawn aggregation timeout checker
     let timeout_aggregator = chunk_aggregator.clone();
-    let timeout_tx = tx_to_links;
+    let timeout_scheduler = link_scheduler.clone();
+    let timeout_link_txs = link_txs;
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(10));
@@ -398,7 +402,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             interval.tick().await;
             let chunk = timeout_aggregator.lock().unwrap().check_timeout();
             if let Some(chunk) = chunk {
-                let _ = timeout_tx.send(chunk).await;
+                let decision = timeout_scheduler.lock().unwrap().schedule(chunk.size(), &chunk.flow_mode);
+                let _ = timeout_link_txs[decision.link_id].send(chunk).await;
             }
         }
     });
@@ -420,8 +425,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             interval.tick().await;
             log_counter += 1;
 
-            // Update stats
-            stats_updater.lock().unwrap().tick();
+            // Update stats — tick() drains atomics and returns deltas for rc
+            let deltas = stats_updater.lock().unwrap().tick();
+
+            // Fold deltas into rate controller
+            {
+                let mut rc = rc_updater.lock().unwrap();
+                for (i, &(tx_bytes, rx_bytes)) in deltas.iter().enumerate() {
+                    if tx_bytes > 0 { rc.record_tx(i, tx_bytes as usize); }
+                    if rx_bytes > 0 { rc.record_rx(i, rx_bytes as usize); }
+                }
+            }
 
             // Get current stats
             let stats = stats_updater.lock().unwrap();
@@ -448,10 +462,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 aggregator_updater.lock().unwrap().update_link_stats(i, bw, (rtt / 1000) as u32);
             }
 
-            // Update flow classifier with current bandwidths and RTTs
+            // Update flow classifier RTTs (for realtime link selection).
+            // NOTE: We do NOT call fc.update_bandwidths() here. The classifier
+            // uses configured link CAPACITIES (from config) for flow hashing and
+            // Bulk detection, not measured throughput from stats. Overwriting
+            // capacities with measured values caused wrong flow distribution
+            // and premature Bulk escalation.
             {
                 let mut fc = classifier_updater.lock().unwrap();
-                fc.update_bandwidths(bandwidths.clone());
                 fc.update_rtts(rc_rtts.clone());
 
                 // Log flow classification stats

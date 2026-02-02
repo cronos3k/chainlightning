@@ -267,9 +267,18 @@ impl LinkScheduler {
                     participating_links: vec![lid],
                 }
             }
-            FlowMode::SingleLink { link_id: _ } => {
-                // Weighted round-robin across all links (existing behavior)
-                self.schedule_single_link(chunk_size)
+            FlowMode::SingleLink { link_id } => {
+                // Honor the assigned link_id — pin flow to one link to avoid
+                // cross-link reordering that destroys TCP throughput
+                let lid = *link_id;
+                if let Some(link) = self.links.get_mut(lid) {
+                    link.record_sent(chunk_size as u64);
+                }
+                ScheduleDecision {
+                    link_id: lid,
+                    delay: Duration::ZERO,
+                    participating_links: vec![lid],
+                }
             }
             FlowMode::Bulk => {
                 // Multi-link with sync delay
