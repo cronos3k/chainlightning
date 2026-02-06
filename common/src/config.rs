@@ -39,6 +39,10 @@ pub struct Config {
 
     /// Rate control settings (Glorytun/MUD-style)
     pub rate_control: RateControlConfig,
+
+    /// Throughput optimizer settings (hill-climbing weight tuning)
+    #[serde(default)]
+    pub optimizer: OptimizerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,6 +299,69 @@ pub struct RateControlConfig {
     pub tapa_cross_link_check: bool,
 }
 
+/// Throughput optimizer configuration (hill-climbing weight tuning)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptimizerConfig {
+    /// Master toggle - optimizer is opt-in (default: false)
+    pub enabled: bool,
+
+    /// Duration of each measurement window in seconds (baseline and experiment)
+    pub measurement_window_secs: u64,
+
+    /// Initial perturbation step size as fraction (0.10 = 10%)
+    pub step_size: f64,
+
+    /// Minimum improvement fraction to accept an experiment (0.05 = 5%)
+    pub min_improvement: f64,
+
+    /// Maximum weight factor (caps how much a link can be boosted)
+    pub max_weight_factor: f64,
+
+    /// Minimum weight factor (caps how much a link can be reduced)
+    pub min_weight_factor: f64,
+
+    /// Cooldown period between experiments in seconds
+    pub cooldown_secs: u64,
+
+    /// Number of samples in the sliding history window
+    pub history_window_size: usize,
+
+    /// Minimum aggregate throughput (bytes/sec) to stay active; below this, go idle
+    pub min_active_throughput: u64,
+
+    /// Step size growth factor on successful experiment
+    pub step_growth_factor: f64,
+
+    /// Step size shrink factor on failed experiment
+    pub step_shrink_factor: f64,
+
+    /// Minimum step size floor
+    pub min_step_size: f64,
+
+    /// Maximum step size ceiling
+    pub max_step_size: f64,
+}
+
+impl Default for OptimizerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,  // Enable by default for testing
+            measurement_window_secs: 30,
+            step_size: 0.10,
+            min_improvement: 0.05,
+            max_weight_factor: 2.0,
+            min_weight_factor: 0.5,
+            cooldown_secs: 5,
+            history_window_size: 60,
+            min_active_throughput: 1_000_000, // 8 Mbps in bytes/sec
+            step_growth_factor: 1.2,
+            step_shrink_factor: 0.7,
+            min_step_size: 0.02,
+            max_step_size: 0.30,
+        }
+    }
+}
+
 impl Default for RateControlConfig {
     fn default() -> Self {
         Self {
@@ -449,6 +516,7 @@ impl Default for Config {
                 force_adsl_only: true,           // Keep realtime on stable links
             },
             rate_control: RateControlConfig::default(),
+            optimizer: OptimizerConfig::default(),
         }
     }
 }

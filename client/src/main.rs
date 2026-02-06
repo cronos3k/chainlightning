@@ -27,6 +27,7 @@ use chainlightning_core::{
     RateController,
     ChunkReceiver,
     StatsCollector,
+    ThroughputOptimizer, OptimizerSnapshot,
     tun::{TunDevice, configure_tun, delete_tun},
 };
 use chainlightning_testing::{TestSuite, create_standard_tests};
@@ -175,6 +176,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RateController::new(config.rate_control.clone(), &link_bandwidths)
     ));
     info!("Rate control: {}", if config.rate_control.enabled { "ENABLED" } else { "DISABLED (static weights)" });
+
+    // Initialize throughput optimizer
+    let optimizer = Arc::new(Mutex::new(
+        ThroughputOptimizer::new(config.optimizer.clone(), NUM_LINKS)
+    ));
+    info!("Throughput optimizer: {}", if config.optimizer.enabled { "ENABLED" } else { "DISABLED (opt-in)" });
 
     // Initialize A/B testing if enabled
     let test_suite = if config.testing.ab_testing_enabled {
@@ -402,7 +409,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let classifier_updater = flow_classifier.clone();
     let rc_updater = rate_controller.clone();
     let receiver_updater = chunk_receiver.clone();
+    let optimizer_updater = optimizer.clone();
     let rc_enabled = config.rate_control.enabled;
+    let optimizer_enabled = config.optimizer.enabled;
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -428,6 +437,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let bandwidths = stats.bandwidths();
             let rtts = stats.rtts();
             let _total_bw = stats.total_bandwidth();
+            let health = stats.health();
 
             info!("{}", stats.summary());
 
@@ -477,6 +487,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scheduler_updater.lock().unwrap().set_rate_controlled_weights(&weights);
             }
 
+            // Throughput optimizer: perturb weight factors, measure, accept/revert
+            if optimizer_enabled {
+                let per_link_loss: Vec<f64> = if rc_enabled {
+                    let rc = rc_updater.lock().unwrap();
+                    (0..NUM_LINKS).map(|i| rc.loss(i) as f64 / 255.0).collect()
+                } else {
+                    vec![0.0; NUM_LINKS]
+                };
+
+                let fc_stats = classifier_updater.lock().unwrap().stats();
+                let opt_snapshot = OptimizerSnapshot {
+                    per_link_bandwidth_bps: bandwidths.clone(),
+                    per_link_loss_ratio: per_link_loss,
+                    per_link_healthy: health.clone(),
+                    active_flow_count: fc_stats.total_flows,
+                };
+
+                if let Some(new_factors) = optimizer_updater.lock().unwrap().tick(opt_snapshot) {
+                    classifier_updater.lock().unwrap().set_weight_factors(new_factors);
+                }
+            }
+
             // Dynamic reorder timeout: 1.5x the one-way RTT spread of bulk-eligible links
             {
                 let spread_ms = scheduler_updater.lock().unwrap().bulk_rtt_spread_ms();
@@ -494,6 +526,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if rc_enabled {
                     let rc = rc_updater.lock().unwrap();
                     info!("{}", rc.status_summary());
+                }
+                if optimizer_enabled {
+                    let opt = optimizer_updater.lock().unwrap();
+                    info!("{}", opt.status_summary());
                 }
             }
 

@@ -155,6 +155,9 @@ pub struct FlowClassifier {
     link_bandwidths: Vec<u64>,
     /// Link RTTs in microseconds
     link_rtts: Vec<u64>,
+    /// Per-link weight factors from optimizer [0.5 - 2.0], default 1.0
+    /// Multiplied with bandwidth in weighted hash bucketing
+    weight_factors: Vec<f64>,
     /// Fastest link ID (by bandwidth)
     fastest_link: usize,
     /// Lowest-latency realtime-eligible link ID
@@ -188,6 +191,7 @@ impl FlowClassifier {
             link_tiers,
             link_bandwidths,
             link_rtts: vec![0; num_links],
+            weight_factors: vec![1.0; num_links],
             fastest_link,
             realtime_link,
             total_bandwidth,
@@ -267,6 +271,16 @@ impl FlowClassifier {
         self.realtime_link = self.find_lowest_latency_eligible();
     }
 
+    /// Set optimizer weight factors (multiplied with bandwidth in hash bucketing)
+    pub fn set_weight_factors(&mut self, factors: Vec<f64>) {
+        self.weight_factors = factors;
+    }
+
+    /// Get current weight factors
+    pub fn weight_factors(&self) -> &[f64] {
+        &self.weight_factors
+    }
+
     /// Assign a link to a flow using weighted hashing based on link bandwidths.
     /// Flows are distributed proportionally: a 220 Mbps Starlink link gets ~3.7x
     /// more flows than a 60 Mbps ADSL link.
@@ -275,7 +289,13 @@ impl FlowClassifier {
             return 0;
         }
 
-        let total: u64 = self.link_bandwidths.iter().sum();
+        // Apply weight factors to bandwidths for proportional hashing
+        let total: u64 = self.link_bandwidths.iter().enumerate()
+            .map(|(i, &bw)| {
+                let factor = self.weight_factors.get(i).copied().unwrap_or(1.0);
+                (bw as f64 * factor) as u64
+            })
+            .sum();
         if total == 0 {
             return 0;
         }
@@ -284,7 +304,8 @@ impl FlowClassifier {
         let bucket = flow_id.0 % total;
         let mut cumulative = 0u64;
         for (i, &bw) in self.link_bandwidths.iter().enumerate() {
-            cumulative += bw;
+            let factor = self.weight_factors.get(i).copied().unwrap_or(1.0);
+            cumulative += (bw as f64 * factor) as u64;
             if bucket < cumulative {
                 return i;
             }
